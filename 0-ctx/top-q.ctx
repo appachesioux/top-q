@@ -1,0 +1,122 @@
+Project Context - ctx
+-----------------------------------
+app-name: top-q
+version: 26.4.2
+description: TUI de monitoramento de sistema — lista enxuta htop-like + detalhe btop-like via divulgação progressiva
+modulos-iniciais: lista de processos, detalhe sob demanda, painel de sistema, sort/filter, sinais
+plataformas: linux (v1), macos (v2 planejado)
+-----------------------------------
+
+config:
+  runtime:      terminal interativo (tty)
+  config-file:  none (convention over configuration)
+  refresh:      1000 ms (override via --delay)
+  theme:        assume terminal de fundo escuro; --no-color e NO_COLOR honrados; light pendente
+
+stack:
+  - zig 0.16.0
+  - libvaxis 0.6.0 (commit e090d3ba — mesma revisão de ~/Devel/xpl-f)
+  - zero deps adicionais (sem libgtop, sem libc obrigatório)
+
+infra:
+  dev:    zig build run
+  build:  zig build (debug) / -Doptimize=ReleaseSmall (~370 KB binário)
+  test:   zig build test (parser unit tests com fixtures /proc/*)
+  thread: 1 main (vaxis.Loop, input+render) + 1 collector (refresh ProcessTable + sample subsegundo do PID em foco); comunicação via Loop.postEvent
+  estrutura:
+    build.zig, build.zig.zon
+    src/main.zig            -> entry point, parse args, inicializa ctx
+    src/app.zig             -> vaxis.Loop, transições de modo
+    src/mode.zig            -> enum Mode (list/detail/filter_input/signal_confirm/help)
+    src/ctx.zig             -> globais de I/O (std.Io, env_map) setadas em main; usadas por toda I/O
+    src/lib.zig             -> agregador pra test module reaproveitar imports
+    src/render.zig          -> lista, header 3-linhas, 4 blocos superiores, status bar
+    src/render_detail.zig   -> painel detail (sparklines, threads, fds)
+    src/process.zig         -> Process, ProcessTable, SystemSummary, ProcessDetail, sendSignal
+    src/procsrc/procsrc.zig -> interface comptime (tagged switch por OS)
+    src/procsrc/linux.zig   -> backend /proc
+    src/procsrc/macos.zig   -> stub (v2)
+    src/sample.zig          -> ProcessSample, ProcessHistory (4 ring buffers de 120)
+    src/graph.zig           -> sparkline Unicode ▁..█
+    src/style.zig           -> paleta + gradientFg/gradientStyle
+    src/view.zig            -> SortKey, SortDir, Filter
+    src/utils.zig           -> RingBuffer, formatBytes, formatDuration, formatPercent, UidCache
+    tests/procsrc_linux_test.zig
+
+types:
+  Pid:          i32
+  Bytes:        u64
+  Percent:      f32 (escala 0..100, nunca 0..1)
+  Jiffies:      u64
+  TimestampNs:  i64 (truncado de i128 retornado por nanoTimestamp)
+
+naming:
+  funções:    camelCase (parseFoo, drawBar)
+  tipos:      PascalCase (Process, SortKey)
+  constantes: SCREAMING_SNAKE (MEM_BLOCK_W, TOP_RATIO_DEN)
+  parsers:    parse{What}
+  desenho:    draw{What}
+
+rules:
+  - config-free: sem arquivo de configuração; controle só por flags + env vars
+  - keyboard-only: zero dependência de mouse
+  - divulgação progressiva: painel detail só do PID em foco, sob demanda
+  - lista ≥75% da altura total da tela
+  - CPU% nunca conta iowait como busy; índices ≥8 de /proc/stat são ignorados (guest/guest_nice já em user/nice)
+  - "Cached" segue fórmula btop++: Cached - Shmem (sem Buffers, sem SReclaimable)
+  - toda métrica nova é validada contra ferramenta de referência (htop/btop/iostat/free/ifconfig) antes de fechar
+  - parsers, cálculos de delta e packing de layout ganham teste antes do merge
+  - leituras /proc não-críticas (ex: /proc/<pid>/io EACCES) degradam para "--"; nunca crasham
+  - sem locks na hot path; ownership transferido via Loop.postEvent
+  - sem libc obrigatória (statfs via syscall direto)
+
+comportamentos:
+  modo lista (default):
+    j/k/↑/↓        -> move seleção 1 linha
+    PgUp/PgDn      -> move 1 página
+    g/G            -> topo/fim
+    Enter/d        -> entra modo detail
+    s              -> cicla sort key
+    r              -> reverte direção do sort
+    /              -> entra modo filter_input
+    \              -> limpa filtro ativo
+    n              -> cicla iface no bloco NET (wrap)
+    D              -> cicla mountpoint no bloco DISK (wrap)
+    K              -> entra modo signal_confirm pro PID selecionado
+    F1             -> overlay de ajuda
+    q/Ctrl-c       -> sai
+  modo detail:
+    Esc/Tab        -> volta pra lista
+    K              -> entra signal_confirm pro PID em foco
+    q/Ctrl-c       -> sai
+    PID desaparece -> fecha detail automaticamente
+  modo filter_input:
+    <chars>        -> filtro substring case-insensitive aplicado ao vivo
+    Backspace      -> apaga 1 char
+    Ctrl-w         -> apaga 1 palavra
+    Ctrl-u         -> apaga tudo
+    Enter/Tab      -> confirma e volta pra lista (filtro permanece ativo)
+    Esc            -> cancela (filtro volta ao estado anterior)
+  modo signal_confirm:
+    Tab            -> cicla sinal (TERM → KILL → HUP → INT)
+    y              -> envia sinal; status bar mostra resultado ~5s
+    qualquer outro -> cancela
+  apresentação:
+    header 1       -> CPU per-core stripe (gradiente verde→amarelo→vermelho)
+    header 2       -> MEM + SWAP barras horizontais
+    header 3       -> DISK barra + throughput (rd · wr na mesma linha)
+    4 blocos sup.  -> MEM (45w) / DISK (45w) / NET (25w) / CPU (flex), borda arredondada com título, altura h/5
+    lista          -> ≥75% da altura; PID/USER/CPU%/MEM%/TIME/COMMAND; cor por estado, linha selecionada com bg sutil
+    sparklines top -> mem%/disk_bps/net_bps no row inferior de cada bloco (mem em gradiente; disk/net em ciano); 120 samples
+    sparklines det -> 4 sparklines (cpu/mem/io_r/io_w) no painel detail; reset ao trocar PID
+  cli:
+    -h/--help            -> ajuda e sai
+    -v/--version         -> versão e sai
+    -d/--delay <ms>      -> refresh rate (default 1000)
+    -u/--user <name>     -> pré-aplica filtro de usuário
+    --no-color           -> desliga cores (também via NO_COLOR=1)
+
+ref:
+  arquitetura: ~/Devel/xpl-f (TUI Zig+libvaxis; reusar padrões)
+  inspiração:  htop (lista limpa, navegação), btop++ (riqueza de detalhe, sparklines)
+  caderno:     0-info.md (gotchas, bugs em aberto, lições, decisões datadas)

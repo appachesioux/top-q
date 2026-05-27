@@ -1,0 +1,16 @@
+.{
+    .fingerprint = 0xe7e53e266d9da678,
+    .name = .top_q,
+    .version = "26.4.5",
+    .dependencies = .{
+        .vaxis = .{
+            .url = "git+https://github.com/rockorager/libvaxis.git#e090d3baecd4b136a3ab95532e4219a3ece81616",
+            .hash = "vaxis-0.6.0-BWNV_EDwCQCjOpS8iRYzYxjh2tTeiOU0KJ8LaWbfYZvG",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

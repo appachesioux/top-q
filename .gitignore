@@ -1,0 +1,15 @@
+zig-out/
+.zig-cache/
+zig-pkg/
+.claude/settings.local.json
+lzd.png
+lzg.png
+top-q.png
+/top-q-agora.png
+/.antigravitycli
+/conf.png
+/btop++.png
+/htop.png
+/CLAUDE.md
+/0-deploy
+/0-info.md
