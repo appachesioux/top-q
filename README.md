@@ -48,4 +48,3 @@ top-q [options]
 
 Linux build is feature-complete for v0.1: process list, navigation, progressive-disclosure detail view (CPU/MEM/IO sparklines, threads, FDs), incremental sort/filter, signal sending with confirmation. macOS backend is stubbed; full implementation is on the roadmap.
 
-See [`specs/001-tui-system-monitor/`](specs/001-tui-system-monitor/) for the active specification, plan, contracts and tasks.
