@@ -64,6 +64,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/lib.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+                .{ .name = "build_options", .module = options.createModule() },
+            },
         });
         const linux_tests = b.addTest(.{
             .root_module = b.createModule(.{

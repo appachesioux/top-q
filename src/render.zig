@@ -19,20 +19,63 @@ pub const TOP_RATIO_DEN: u16 = 5;
 
 // Fixed widths for the leftmost top blocks. CPU block flexes to fill rest.
 // MEM/DISK rows carry "label NN% used/total [bar]" — 32 cols keep the bar legible.
-pub const MEM_BLOCK_W: u16 = 45;
-pub const DISK_BLOCK_W: u16 = 45;
+pub const SYS_BLOCK_W: u16 = 50;
+pub const MEM_BLOCK_W: u16 = 35;
+pub const DISK_BLOCK_W: u16 = 40;
 pub const NET_BLOCK_W: u16 = 25;
-pub const SYS_BLOCK_W: u16 = 36;
 
-/// Height reserved at the top of the window for the 4 info blocks.
-pub fn topAreaHeight(h: u16) u16 {
-    return h / TOP_RATIO_DEN;
+pub fn topLayoutHeights(h: u16, w: u16, ncores: u16) struct { row1: u16, row2: u16, total: u16 } {
+    const row1: u16 = if (h < 28) 4 else 5;
+
+    // Minimum CPU height matching standard layouts
+    const min_cpu_h: u16 = if (h < 28) 4 else if (h < 35) 5 else 6;
+
+    // Budget: header total cannot exceed 33% of h, but we allow at least 11 rows total as fallback.
+    const max_total_h = @max(11, h / 3);
+    const max_cpu_h = if (max_total_h > row1) max_total_h - row1 else min_cpu_h;
+
+    const box_w: u16 = if (w > 2) w - 2 else 0;
+    const min_cell_w: u16 = 13;
+    const target_cell_w: u16 = 28;
+
+    // Calculate ncols for target layout
+    var ncols = if (box_w >= target_cell_w) box_w / target_cell_w else 1;
+    if (ncols > ncores) ncols = ncores;
+
+    // Calculate minimum ncols needed to fit vertically in budget
+    const avail_inner_rows = if (max_cpu_h > 2) max_cpu_h - 2 else 1;
+    const min_ncols_needed = if (ncores > 0) (ncores + avail_inner_rows - 1) / avail_inner_rows else 1;
+
+    // If we need more columns to fit vertically, increase ncols
+    if (ncols < min_ncols_needed) {
+        ncols = min_ncols_needed;
+    }
+
+    const cell_w = if (ncols > 0) box_w / ncols else box_w;
+    const rows_needed = if (ncols > 0 and ncores > 0) (ncores + ncols - 1) / ncols else 1;
+    const cpu_height_as_bars = rows_needed + 2;
+
+    const grid_inner_rows = if (box_w > 0 and ncores > 0) (ncores + box_w - 1) / box_w else 1;
+    const cpu_height_as_grid = grid_inner_rows + 2;
+
+    // Fall back to grid if columns don't fit minimum cell width
+    const row2: u16 = if (cell_w >= min_cell_w and cpu_height_as_bars <= max_cpu_h)
+        @max(min_cpu_h, cpu_height_as_bars)
+    else
+        @min(max_cpu_h, @max(min_cpu_h, cpu_height_as_grid));
+
+    return .{ .row1 = row1, .row2 = row2, .total = row1 + row2 };
+}
+
+/// Height reserved at the top of the window for the info blocks.
+pub fn topAreaHeight(h: u16, w: u16, ncores: u16) u16 {
+    return topLayoutHeights(h, w, ncores).total;
 }
 
 /// Total rows reserved for chrome: top panels + list box borders (2) +
 /// column header (1, inside the box) + status bar (1).
-pub fn chromeRows(h: u16) u16 {
-    return topAreaHeight(h) + 4;
+pub fn chromeRows(h: u16, w: u16, ncores: u16) u16 {
+    return topAreaHeight(h, w, ncores) + 4;
 }
 
 /// Top-level draw function. `procs_sorted` is a slice of indices into
@@ -55,7 +98,7 @@ pub fn draw(
         return;
     }
 
-    const top_h = topAreaHeight(h);
+    const top_h = topAreaHeight(h, w, @intCast(summary.per_cpu.len));
     drawTopPanels(alloc, win, w, top_h, summary, sys_history, state);
 
     // Bordered frame around column header + process list (btop-style).
@@ -124,29 +167,39 @@ fn drawTopPanels(
     sys_history: *const sample_mod.SystemHistory,
     state: *const view_mod.ViewState,
 ) void {
-    if (top_h < 3) return;
+    _ = top_h;
+    const heights = topLayoutHeights(win.height, w, @intCast(s.per_cpu.len));
+    if (heights.total < 6) return;
 
-    var x: u16 = 0;
-    drawMemBlock(alloc, win, x, 0, MEM_BLOCK_W, top_h, s, sys_history);
-    x += MEM_BLOCK_W;
-    if (x >= w) return;
+    // Row 1: sys, mem, disk, net (distributed symmetrically)
+    const n_blocks: u16 = if (w < 115) 2 else if (w < 150) 3 else 4;
+    const base_w = w / n_blocks;
 
-    drawDiskBlock(alloc, win, x, 0, DISK_BLOCK_W, top_h, s, sys_history);
-    x += DISK_BLOCK_W;
-    if (x >= w) return;
+    // 1. sys block
+    const sys_w = base_w;
+    drawSysBlock(alloc, win, 0, 0, sys_w, heights.row1, s);
+    var x = sys_w;
 
-    drawNetBlock(alloc, win, x, 0, NET_BLOCK_W, top_h, s, sys_history);
-    x += NET_BLOCK_W;
-    if (x >= w) return;
+    // 2. mem block
+    const mem_w = if (n_blocks == 2) w - x else base_w;
+    drawMemBlock(alloc, win, x, 0, mem_w, heights.row1, s, sys_history);
+    x += mem_w;
 
-    const sys_drawn = (x + SYS_BLOCK_W + 15 <= w);
-    if (sys_drawn) {
-        drawSysBlock(alloc, win, x, 0, SYS_BLOCK_W, top_h, s);
-        x += SYS_BLOCK_W;
+    // 3. disk block
+    if (n_blocks >= 3) {
+        const disk_w = if (n_blocks == 3) w - x else base_w;
+        drawDiskBlock(alloc, win, x, 0, disk_w, heights.row1, s, sys_history);
+        x += disk_w;
     }
 
-    const load_in_sys = sys_drawn and (top_h >= 7);
-    drawCpuBlock(alloc, win, x, 0, w - x, top_h, s, sys_history, state, load_in_sys);
+    // 4. net block
+    if (n_blocks >= 4) {
+        const net_w = w - x;
+        drawNetBlock(alloc, win, x, 0, net_w, heights.row1, s, sys_history);
+    }
+
+    // Row 2: cpu (spans entire width w)
+    drawCpuBlock(alloc, win, 0, heights.row1, w, heights.row2, s, sys_history, state, true);
 }
 
 fn borderedBox(win: Window, x: u16, y: u16, w: u16, h: u16) Window {
@@ -400,6 +453,57 @@ fn drawNetBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
 /// plenty of vertical room; 2+ cols when rows are scarce). Falls back to the
 /// 1-char-per-core coloured grid if even the shortest per-core cell doesn't
 /// fit horizontally.
+pub const CpuLayout = struct {
+    ncols: u16,
+    cell_w: u16,
+    bar_interior_w: u16,
+    fallback_to_grid: bool,
+};
+
+pub fn computeCpuLayout(ncores: u16, avail_rows: u16, box_width: u16, min_cell_w: u16) CpuLayout {
+    if (ncores == 0 or avail_rows == 0 or box_width == 0) {
+        return .{
+            .ncols = 1,
+            .cell_w = 0,
+            .bar_interior_w = 0,
+            .fallback_to_grid = true,
+        };
+    }
+
+    var ncols: u16 = 1;
+    while (ncols < ncores) {
+        const rows_needed = (ncores + ncols - 1) / ncols;
+        if (rows_needed <= avail_rows) break;
+        ncols += 1;
+    }
+    // Respect horizontal budget: drop columns until the cell fits min width.
+    while (ncols > 1 and box_width / ncols < min_cell_w) : (ncols -= 1) {}
+
+    const rows_needed = (ncores + ncols - 1) / ncols;
+    if (box_width / ncols < min_cell_w or rows_needed > avail_rows) {
+        return .{
+            .ncols = ncols,
+            .cell_w = box_width / ncols,
+            .bar_interior_w = 0,
+            .fallback_to_grid = true,
+        };
+    }
+
+    const cell_w = box_width / ncols;
+    const bar_interior_w = cell_w - min_cell_w + 1;
+    return .{
+        .ncols = ncols,
+        .cell_w = cell_w,
+        .bar_interior_w = bar_interior_w,
+        .fallback_to_grid = false,
+    };
+}
+
+/// Render per-core bars htop/btop-style inside the CPU block. Packs cores
+/// into as many columns as fit horizontally (1 col when only a few cores and
+/// plenty of vertical room; 2+ cols when rows are scarce). Falls back to the
+/// 1-char-per-core coloured grid if even the shortest per-core cell doesn't
+/// fit horizontally.
 fn drawCpuCores(
     alloc: std.mem.Allocator,
     box: Window,
@@ -416,25 +520,17 @@ fn drawCpuCores(
     // Label 3, leading/brackets/spaces 5, pct 4, trailing separator 1 → 13 fixed.
     const min_cell_w: u16 = 13;
 
-    // Pick ncols: smallest that fits vertically. If even 1 column overflows the
-    // available rows, we still pack more columns to cram cores in.
-    var ncols: u16 = 1;
-    while (ncols < ncores) {
-        const rows_needed = (ncores + ncols - 1) / ncols;
-        if (rows_needed <= avail_rows) break;
-        ncols += 1;
-    }
-    // Respect horizontal budget: drop columns until the cell fits min width.
-    while (ncols > 1 and box.width / ncols < min_cell_w) : (ncols -= 1) {}
+    const layout = computeCpuLayout(ncores, avail_rows, box.width, min_cell_w);
 
-    if (box.width / ncols < min_cell_w) {
+    if (layout.fallback_to_grid) {
         // Not enough room for labelled bars — fall back to the 1-char grid.
         drawCpuCoreGrid(box, per_cpu, first_row, last_row);
         return;
     }
 
-    const cell_w: u16 = box.width / ncols;
-    const bar_interior_w: u16 = cell_w - min_cell_w + 1; // leftover widens the bar
+    const cell_w = layout.cell_w;
+    const bar_interior_w = layout.bar_interior_w;
+    const ncols = layout.ncols;
 
     for (per_cpu, 0..) |core_pct, i| {
         const col: u16 = @intCast(i % ncols);

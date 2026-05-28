@@ -443,7 +443,9 @@ pub const App = struct {
 
     fn visibleRows(self: *App) usize {
         const h = self.vx.window().height;
-        const chrome = render.chromeRows(@intCast(h));
+        const w = self.vx.window().width;
+        const ncores: u16 = @intCast(self.summary.per_cpu.len);
+        const chrome = render.chromeRows(@intCast(h), @intCast(w), ncores);
         if (h <= chrome) return 0;
         return @as(usize, h) - @as(usize, chrome);
     }

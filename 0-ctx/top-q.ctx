@@ -105,8 +105,8 @@ comportamentos:
     header 1       -> CPU per-core stripe (gradiente verde→amarelo→vermelho)
     header 2       -> MEM + SWAP barras horizontais
     header 3       -> DISK barra + throughput (rd · wr na mesma linha)
-    4 blocos sup.  -> MEM (45w) / DISK (45w) / NET (25w) / CPU (flex), borda arredondada com título, altura h/5
-    lista          -> ≥75% da altura; PID/USER/CPU%/MEM%/TIME/COMMAND; cor por estado, linha selecionada com bg sutil
+    blocos sup.    -> linha 1: SYS / MEM / DISK / NET flexíveis; linha 2: CPU (flex total); altura total dinâmica (7 a 10 linhas)
+    lista          -> altura flexível adaptada ao cabeçalho; PID/USER/CPU%/MEM%/TIME/COMMAND; cor por estado, linha selecionada com bg sutil
     sparklines top -> mem%/disk_bps/net_bps no row inferior de cada bloco (mem em gradiente; disk/net em ciano); 120 samples
     sparklines det -> 4 sparklines (cpu/mem/io_r/io_w) no painel detail; reset ao trocar PID
   cli:
