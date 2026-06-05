@@ -105,7 +105,9 @@ comportamentos:
     header 1       -> CPU per-core stripe (gradiente verde→amarelo→vermelho)
     header 2       -> MEM + SWAP barras horizontais
     header 3       -> DISK barra + throughput (rd · wr na mesma linha)
-    blocos sup.    -> linha 1: SYS / MEM / DISK / NET flexíveis; linha 2: CPU (flex total); altura total dinâmica (7 a 10 linhas)
+    blocos sup.    -> linha 1: SYS / MEM / DISK / NET flexíveis; linha 2: CPU (flex total); altura da linha 1 dirigida pelo conteúdo do SYS (6 linhas fixas + 1 por GPU); lista cede altura
+    bloco SYS      -> OS/host, kernel, uptime, CPU model, GPUs (só existência: nome NVIDIA via procfs do driver; AMD/Intel vendor+driver), load, battery
+    títulos info   -> disk mostra fs type (" disk · btrfs "); cpu mostra freq atual máx entre cores (" … avg N% · X.XX GHz ")
     lista          -> altura flexível adaptada ao cabeçalho; PID/USER/CPU%/MEM%/TIME/COMMAND; cor por estado, linha selecionada com bg sutil
     sparklines top -> mem%/disk_bps/net_bps no row inferior de cada bloco (mem em gradiente; disk/net em ciano); 120 samples
     sparklines det -> 4 sparklines (cpu/mem/io_r/io_w) no painel detail; reset ao trocar PID

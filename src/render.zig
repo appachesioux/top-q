@@ -24,15 +24,25 @@ pub const MEM_BLOCK_W: u16 = 35;
 pub const DISK_BLOCK_W: u16 = 40;
 pub const NET_BLOCK_W: u16 = 25;
 
-pub fn topLayoutHeights(h: u16, w: u16, ncores: u16) struct { row1: u16, row2: u16, total: u16 } {
-    const row1: u16 = if (h < 28) 4 else 5;
+/// Fixed sys-block content rows: OS, Kernel, Uptime, CPU, Load, Battery.
+/// GPUs add one row each on top of these.
+pub const SYS_FIXED_ROWS: u16 = 6;
+
+pub fn topLayoutHeights(h: u16, w: u16, ncores: u16, ngpus: u16) struct { row1: u16, row2: u16, total: u16 } {
+    // Row 1 is content-driven: tall enough for the full sys block (+2 border
+    // rows); the process list gives up the rows (user decision 2026-06-05).
+    // Very short terminals keep the old compact height and cut sys content.
+    const row1: u16 = if (h < 28) 4 else SYS_FIXED_ROWS + ngpus + 2;
 
     // Minimum CPU height matching standard layouts
     const min_cpu_h: u16 = if (h < 28) 4 else if (h < 35) 5 else 6;
 
     // Budget: header total cannot exceed 33% of h, but we allow at least 11 rows total as fallback.
+    // The cpu budget is computed against the pre-growth row1 baseline (5) so
+    // a taller sys block shrinks the process list, not the cpu block.
+    const row1_baseline: u16 = if (h < 28) 4 else 5;
     const max_total_h = @max(11, h / 3);
-    const max_cpu_h = if (max_total_h > row1) max_total_h - row1 else min_cpu_h;
+    const max_cpu_h = if (max_total_h > row1_baseline) max_total_h - row1_baseline else min_cpu_h;
 
     const box_w: u16 = if (w > 2) w - 2 else 0;
     const min_cell_w: u16 = 13;
@@ -68,14 +78,14 @@ pub fn topLayoutHeights(h: u16, w: u16, ncores: u16) struct { row1: u16, row2: u
 }
 
 /// Height reserved at the top of the window for the info blocks.
-pub fn topAreaHeight(h: u16, w: u16, ncores: u16) u16 {
-    return topLayoutHeights(h, w, ncores).total;
+pub fn topAreaHeight(h: u16, w: u16, ncores: u16, ngpus: u16) u16 {
+    return topLayoutHeights(h, w, ncores, ngpus).total;
 }
 
 /// Total rows reserved for chrome: top panels + list box borders (2) +
 /// column header (1, inside the box) + status bar (1).
-pub fn chromeRows(h: u16, w: u16, ncores: u16) u16 {
-    return topAreaHeight(h, w, ncores) + 4;
+pub fn chromeRows(h: u16, w: u16, ncores: u16, ngpus: u16) u16 {
+    return topAreaHeight(h, w, ncores, ngpus) + 4;
 }
 
 /// Top-level draw function. `procs_sorted` is a slice of indices into
@@ -98,7 +108,7 @@ pub fn draw(
         return;
     }
 
-    const top_h = topAreaHeight(h, w, @intCast(summary.per_cpu.len));
+    const top_h = topAreaHeight(h, w, @intCast(summary.per_cpu.len), @intCast(summary.gpus.len));
     drawTopPanels(alloc, win, w, top_h, summary, sys_history, state);
 
     // Bordered frame around column header + process list (btop-style).
@@ -168,7 +178,7 @@ fn drawTopPanels(
     state: *const view_mod.ViewState,
 ) void {
     _ = top_h;
-    const heights = topLayoutHeights(win.height, w, @intCast(s.per_cpu.len));
+    const heights = topLayoutHeights(win.height, w, @intCast(s.per_cpu.len), @intCast(s.gpus.len));
     if (heights.total < 6) return;
 
     // Row 1: sys, mem, disk, net (distributed symmetrically)
@@ -339,9 +349,9 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
     const swap_pct = pctOf(s.swap_used_bytes, s.swap_total_bytes);
 
     const rows = [_]LabelledRow{
-        .{ .label = "Used", .pct = used_pct, .abs = absUsedTotal(alloc, s.mem_used_bytes, s.mem_total_bytes) },
-        .{ .label = "Cache", .pct = cache_pct, .abs = absUsedTotal(alloc, s.mem_cache_bytes, s.mem_total_bytes) },
-        .{ .label = "Swap", .pct = swap_pct, .abs = absUsedTotal(alloc, s.swap_used_bytes, s.swap_total_bytes) },
+        .{ .label = "Used:", .pct = used_pct, .abs = absUsedTotal(alloc, s.mem_used_bytes, s.mem_total_bytes) },
+        .{ .label = "Cache:", .pct = cache_pct, .abs = absUsedTotal(alloc, s.mem_cache_bytes, s.mem_total_bytes) },
+        .{ .label = "Swap:", .pct = swap_pct, .abs = absUsedTotal(alloc, s.swap_used_bytes, s.swap_total_bytes) },
     };
     drawLabelledBars(alloc, box, &rows);
 
@@ -373,7 +383,11 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
 
 fn drawDiskBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h: u16, s: *const process.SystemSummary, sys_history: *const sample_mod.SystemHistory) void {
     const box = borderedBox(win, x, y, w, h);
-    drawBorderTitle(win, x, y, " disk ");
+    const disk_title = if (s.fs_type_name.len > 0)
+        std.fmt.allocPrint(alloc, " disk · {s} ", .{s.fs_type_name}) catch " disk "
+    else
+        " disk ";
+    drawBorderTitle(win, x, y, disk_title);
     if (box.height < 1) return;
 
     const root_pct = pctOf(s.fs_root_used_bytes, s.fs_root_total_bytes);
@@ -614,7 +628,7 @@ fn drawSysBlock(
 
     // Row 0: OS / Host
     if (row < inner_h) {
-        _ = box.printSegment(.{ .text = " OS: ", .style = style.dim_style }, .{
+        _ = box.printSegment(.{ .text = " OS: ", .style = style.status_key_style }, .{
             .row_offset = row,
             .col_offset = 0,
         });
@@ -634,7 +648,7 @@ fn drawSysBlock(
 
     // Row 1: Kernel
     if (row < inner_h) {
-        _ = box.printSegment(.{ .text = " Kernel: ", .style = style.dim_style }, .{
+        _ = box.printSegment(.{ .text = " Kernel: ", .style = style.status_key_style }, .{
             .row_offset = row,
             .col_offset = 0,
         });
@@ -649,7 +663,7 @@ fn drawSysBlock(
 
     // Row 2: Uptime
     if (row < inner_h) {
-        _ = box.printSegment(.{ .text = " Uptime: ", .style = style.dim_style }, .{
+        _ = box.printSegment(.{ .text = " Uptime: ", .style = style.status_key_style }, .{
             .row_offset = row,
             .col_offset = 0,
         });
@@ -666,7 +680,7 @@ fn drawSysBlock(
 
     // Row 3: CPU Model
     if (row < inner_h) {
-        _ = box.printSegment(.{ .text = " CPU: ", .style = style.dim_style }, .{
+        _ = box.printSegment(.{ .text = " CPU: ", .style = style.cpu_hot_style }, .{
             .row_offset = row,
             .col_offset = 0,
         });
@@ -679,9 +693,24 @@ fn drawSysBlock(
         row += 1;
     }
 
-    // Row 4: Load Average
+    // GPU rows: one per detected device (existence only).
+    for (s.gpus) |gpu_name| {
+        if (row >= inner_h) break;
+        _ = box.printSegment(.{ .text = " GPU: ", .style = style.status_key_style }, .{
+            .row_offset = row,
+            .col_offset = 0,
+        });
+        const truncated_g = truncOrPad(gpu_name, box.width - 6);
+        _ = box.printSegment(.{ .text = truncated_g, .style = style.default_style }, .{
+            .row_offset = row,
+            .col_offset = 6,
+        });
+        row += 1;
+    }
+
+    // Load Average
     if (row < inner_h) {
-        _ = box.printSegment(.{ .text = " Load: ", .style = style.dim_style }, .{
+        _ = box.printSegment(.{ .text = " Load: ", .style = style.status_key_style }, .{
             .row_offset = row,
             .col_offset = 0,
         });
@@ -698,9 +727,9 @@ fn drawSysBlock(
         row += 1;
     }
 
-    // Row 5: Battery
+    // Battery (last row)
     if (row < inner_h) {
-        _ = box.printSegment(.{ .text = " Battery: ", .style = style.dim_style }, .{
+        _ = box.printSegment(.{ .text = " Battery: ", .style = style.status_key_style }, .{
             .row_offset = row,
             .col_offset = 0,
         });
@@ -741,17 +770,27 @@ fn drawCpuBlock(
     const box = borderedBox(win, x, y, w, h);
     if (box.width == 0 or box.height == 0) return;
 
-    // Title carries live data: core count + aggregate CPU% + optional filter tag.
+    // Title carries live data: core count + aggregate CPU% + current max core
+    // frequency + optional filter tag.
+    var freq_buf: [16]u8 = undefined;
+    const freq_s: []const u8 = if (s.cpu_freq_mhz == 0)
+        ""
+    else if (s.cpu_freq_mhz >= 1000)
+        std.fmt.bufPrint(&freq_buf, " · {d:.2} GHz", .{@as(f32, @floatFromInt(s.cpu_freq_mhz)) / 1000.0}) catch ""
+    else
+        std.fmt.bufPrint(&freq_buf, " · {d} MHz", .{s.cpu_freq_mhz}) catch "";
     const title = if (state.filter.isActive()) blk: {
-        break :blk std.fmt.allocPrint(alloc, " cpu — {d} cores, avg {d:.0}% · filter {s}: {s} ", .{
+        break :blk std.fmt.allocPrint(alloc, " cpu — {d} cores, avg {d:.0}%{s} · filter {s}: {s} ", .{
             s.per_cpu.len,
             s.cpu_pct_total,
+            freq_s,
             view_mod.filterFieldLabel(state.filter.field),
             state.filter.text(),
         }) catch " cpu ";
-    } else std.fmt.allocPrint(alloc, " cpu — {d} cores, avg {d:.0}% ", .{
+    } else std.fmt.allocPrint(alloc, " cpu — {d} cores, avg {d:.0}%{s} ", .{
         s.per_cpu.len,
         s.cpu_pct_total,
+        freq_s,
     }) catch " cpu ";
     drawBorderTitle(win, x, y, title);
 

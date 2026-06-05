@@ -776,6 +776,7 @@ pub const Linux = struct {
         // directly with our own struct layout (Linux x86_64/aarch64).
         var fs_used: u64 = 0;
         var fs_total: u64 = 0;
+        var fs_type: []const u8 = "";
         var path_z: [257]u8 = undefined;
         const cur_path = self.disk_mount_buf[0..self.disk_mount_len];
         @memcpy(path_z[0..cur_path.len], cur_path);
@@ -787,12 +788,16 @@ pub const Linux = struct {
             fs_total = sf.blocks * bsize;
             const free = sf.bavail * bsize;
             fs_used = if (fs_total > free) fs_total - free else 0;
+            fs_type = fsTypeName(sf.type);
         }
         const fs_mount_owned: []const u8 = alloc.dupe(u8, cur_path) catch "/";
 
         var bat_pct: ?u8 = null;
         var bat_status: []const u8 = "";
         parseBattery(alloc, &bat_pct, &bat_status);
+
+        const cpu_freq_mhz = readCpuFreqMhz(self.nproc);
+        const gpus = detectGpus(alloc);
 
         const net_ip = queryIfaceIp(iface_name_owned, alloc);
         const os_name = parseOsName(alloc);
@@ -816,6 +821,7 @@ pub const Linux = struct {
             .fs_root_used_bytes = fs_used,
             .fs_root_total_bytes = fs_total,
             .fs_mount_path = fs_mount_owned,
+            .fs_type_name = fs_type,
             .net_iface_name = iface_name_owned,
             .net_rx_bps = net_rx_bps,
             .net_tx_bps = net_tx_bps,
@@ -824,6 +830,8 @@ pub const Linux = struct {
             .kernel_release = kernel_release,
             .host_model = host_model,
             .cpu_model = cpu_model,
+            .cpu_freq_mhz = cpu_freq_mhz,
+            .gpus = gpus,
             .battery_pct = bat_pct,
             .battery_status = bat_status,
         };
@@ -1019,6 +1027,29 @@ const Statfs64 = extern struct {
     spare: [4]i64,
 };
 
+/// Map a statfs `f_type` magic number to a filesystem name. Magics from
+/// linux/magic.h. Returns "" for unknown types (caller hides the label).
+pub fn fsTypeName(magic: i64) []const u8 {
+    return switch (magic) {
+        0x9123683E => "btrfs",
+        0xEF53 => "ext4",
+        0x58465342 => "xfs",
+        0xF2F52010 => "f2fs",
+        0x2FC12FC1 => "zfs",
+        0xCA451A4E => "bcachefs",
+        0x5346544E => "ntfs",
+        0x2011BAB0 => "exfat",
+        0x4D44 => "vfat",
+        0x01021994 => "tmpfs",
+        0x794C7630 => "overlay",
+        0x73717368 => "squashfs",
+        0x65735546 => "fuse",
+        0x6969 => "nfs",
+        0xFF534D42, 0xFE534D42 => "smb",
+        else => "",
+    };
+}
+
 fn parseOsName(alloc: std.mem.Allocator) []const u8 {
     var buf: [2048]u8 = undefined;
     const n = readSmallFile("/etc/os-release", &buf) catch return "Linux";
@@ -1078,6 +1109,134 @@ fn parseCpuModel(alloc: std.mem.Allocator) []const u8 {
         }
     }
     return "Unknown CPU";
+}
+
+/// DRIVER / PCI_ID / PCI_SLOT_NAME fields of a drm device uevent file.
+/// Slices borrow from the input buffer.
+pub const GpuUevent = struct {
+    driver: []const u8 = "",
+    pci_id: []const u8 = "",
+    slot: []const u8 = "",
+};
+
+pub fn parseGpuUevent(content: []const u8) GpuUevent {
+    var out = GpuUevent{};
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "DRIVER=")) {
+            out.driver = std.mem.trim(u8, line["DRIVER=".len..], " \t\r");
+        } else if (std.mem.startsWith(u8, line, "PCI_ID=")) {
+            out.pci_id = std.mem.trim(u8, line["PCI_ID=".len..], " \t\r");
+        } else if (std.mem.startsWith(u8, line, "PCI_SLOT_NAME=")) {
+            out.slot = std.mem.trim(u8, line["PCI_SLOT_NAME=".len..], " \t\r");
+        }
+    }
+    return out;
+}
+
+/// Marketing model name from /proc/driver/nvidia/gpus/<slot>/information
+/// ("Model:" line). Borrows from the input buffer; null when absent.
+pub fn parseNvidiaModel(content: []const u8) ?[]const u8 {
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "Model:")) {
+            const val = std.mem.trim(u8, line["Model:".len..], " \t\r");
+            if (val.len > 0) return val;
+        }
+    }
+    return null;
+}
+
+/// PCI vendor prefix of a "VVVV:DDDD" PCI_ID → human vendor name; "" when
+/// unrecognised.
+pub fn gpuVendorName(pci_id: []const u8) []const u8 {
+    if (pci_id.len < 4) return "";
+    const v = pci_id[0..4];
+    if (std.ascii.eqlIgnoreCase(v, "10DE")) return "NVIDIA";
+    if (std.ascii.eqlIgnoreCase(v, "1002")) return "AMD";
+    if (std.ascii.eqlIgnoreCase(v, "8086")) return "Intel";
+    return "";
+}
+
+const MAX_GPUS = 4;
+
+/// Detect PCI GPUs via /sys/class/drm/card<N>/device/uevent. NVIDIA cards get
+/// their marketing name from the proprietary driver's procfs when available;
+/// others show "<vendor> (<driver>)". Names are alloc-owned (collector arena).
+/// Existence only — no usage/VRAM/temp (zero-deps rule).
+fn detectGpus(alloc: std.mem.Allocator) []const []const u8 {
+    var names: [MAX_GPUS][]const u8 = undefined;
+    var nums: [MAX_GPUS]u32 = undefined;
+    var count: usize = 0;
+
+    var dir = std.Io.Dir.openDirAbsolute(ctx.io, "/sys/class/drm", .{ .iterate = true }) catch return &.{};
+    defer dir.close(ctx.io);
+    var iter = dir.iterate();
+    while (iter.next(ctx.io) catch null) |entry| {
+        if (count >= MAX_GPUS) break;
+        if (!std.mem.startsWith(u8, entry.name, "card")) continue;
+        // "card1" passes; connectors like "card1-HDMI-A-1" don't parse.
+        const num = std.fmt.parseInt(u32, entry.name["card".len..], 10) catch continue;
+
+        var path_buf: [128]u8 = undefined;
+        const uevent_path = std.fmt.bufPrint(&path_buf, "/sys/class/drm/{s}/device/uevent", .{entry.name}) catch continue;
+        var uevent_buf: [1024]u8 = undefined;
+        const n = readSmallFile(uevent_path, &uevent_buf) catch continue;
+        const ue = parseGpuUevent(uevent_buf[0..n]);
+        if (ue.pci_id.len == 0) continue; // not a PCI device (vgem, vkms, ...)
+
+        const vendor = gpuVendorName(ue.pci_id);
+        var name: []const u8 = "";
+        if (std.mem.eql(u8, vendor, "NVIDIA") and ue.slot.len > 0) {
+            var info_path_buf: [128]u8 = undefined;
+            if (std.fmt.bufPrint(&info_path_buf, "/proc/driver/nvidia/gpus/{s}/information", .{ue.slot}) catch null) |info_path| {
+                var info_buf: [2048]u8 = undefined;
+                if (readSmallFile(info_path, &info_buf) catch null) |in_n| {
+                    if (parseNvidiaModel(info_buf[0..in_n])) |m| {
+                        name = alloc.dupe(u8, m) catch "";
+                    }
+                }
+            }
+        }
+        if (name.len == 0) {
+            if (vendor.len > 0) {
+                name = std.fmt.allocPrint(alloc, "{s} ({s})", .{ vendor, ue.driver }) catch continue;
+            } else if (ue.driver.len > 0) {
+                name = alloc.dupe(u8, ue.driver) catch continue;
+            } else continue;
+        }
+
+        // Insertion sort by card number for a stable display order.
+        var i = count;
+        while (i > 0 and nums[i - 1] > num) : (i -= 1) {
+            nums[i] = nums[i - 1];
+            names[i] = names[i - 1];
+        }
+        nums[i] = num;
+        names[i] = name;
+        count += 1;
+    }
+
+    const out = alloc.alloc([]const u8, count) catch return &.{};
+    @memcpy(out, names[0..count]);
+    return out;
+}
+
+/// Highest current core frequency in MHz, read from cpufreq sysfs (values are
+/// in kHz). Max across cores shows boost behaviour on heterogeneous CPUs.
+/// Returns 0 when cpufreq is unavailable (caller hides the figure).
+fn readCpuFreqMhz(nproc: u32) u32 {
+    var max_khz: u64 = 0;
+    var cpu: u32 = 0;
+    while (cpu < nproc) : (cpu += 1) {
+        var path_buf: [80]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/cpufreq/scaling_cur_freq", .{cpu}) catch continue;
+        var buf: [32]u8 = undefined;
+        const n = readSmallFile(path, &buf) catch continue;
+        const khz = std.fmt.parseInt(u64, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch continue;
+        if (khz > max_khz) max_khz = khz;
+    }
+    return @intCast(max_khz / 1000);
 }
 
 fn parseBattery(alloc: std.mem.Allocator, pct_out: *?u8, status_out: *[]const u8) void {

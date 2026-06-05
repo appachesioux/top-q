@@ -197,6 +197,9 @@ pub const SystemSummary = struct {
     fs_root_total_bytes: u64 = 0,
     /// Mountpoint currently shown in the disk block. Cyclable via `D`. Arena-owned.
     fs_mount_path: []const u8 = "/",
+    /// Filesystem type name ("btrfs", "ext4", ...) of the shown mount; empty
+    /// when unknown. Static string (not arena-owned).
+    fs_type_name: []const u8 = "",
 
     // ----- Network (primary physical interface) -----
     /// Empty when no physical interface was detected. Arena-owned.
@@ -210,6 +213,10 @@ pub const SystemSummary = struct {
     kernel_release: []const u8 = "",
     host_model: []const u8 = "",
     cpu_model: []const u8 = "",
+    /// Highest current core frequency in MHz; 0 when cpufreq is unavailable.
+    cpu_freq_mhz: u32 = 0,
+    /// PCI GPU names (existence only — no usage metrics). Arena-owned.
+    gpus: []const []const u8 = &.{},
     battery_pct: ?u8 = null,
     battery_status: []const u8 = "",
 };

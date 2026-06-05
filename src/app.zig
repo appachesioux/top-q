@@ -445,7 +445,8 @@ pub const App = struct {
         const h = self.vx.window().height;
         const w = self.vx.window().width;
         const ncores: u16 = @intCast(self.summary.per_cpu.len);
-        const chrome = render.chromeRows(@intCast(h), @intCast(w), ncores);
+        const ngpus: u16 = @intCast(self.summary.gpus.len);
+        const chrome = render.chromeRows(@intCast(h), @intCast(w), ncores, ngpus);
         if (h <= chrome) return 0;
         return @as(usize, h) - @as(usize, chrome);
     }
