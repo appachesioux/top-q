@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=top-q
+GenericName=Process Viewer
+Comment=Show System Processes
+Icon=top-q
+Exec=top-q
+Terminal=true
+Categories=System;Monitor;ConsoleOnly;
+Keywords=system;process;task
