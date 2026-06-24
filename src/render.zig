@@ -960,8 +960,8 @@ fn drawList(
 
         // Render row text
         const max_cmd: usize = if (w > 35) @as(usize, w) - 35 else 0;
-        var truncated_comm: []const u8 = p.comm;
-        if (truncated_comm.len > max_cmd) truncated_comm = truncated_comm[0..max_cmd];
+        var truncated_cmd: []const u8 = p.cmdline;
+        if (truncated_cmd.len > max_cmd) truncated_cmd = truncated_cmd[0..max_cmd];
 
         const state_char = [_]u8{p.state.char()};
         const text = std.fmt.allocPrint(alloc, "{d:>7} {s:<10} {s:<1} {d:>5.1} {d:>5.1} {s}", .{
@@ -970,7 +970,7 @@ fn drawList(
             &state_char,
             p.cpu_pct,
             mem_pct,
-            truncated_comm,
+            truncated_cmd,
         }) catch continue;
 
         _ = win.printSegment(.{ .text = text, .style = line_style }, .{

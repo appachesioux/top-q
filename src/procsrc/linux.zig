@@ -434,6 +434,7 @@ pub const Linux = struct {
     last_total_jiffies: u64, // for global CPU% (header)
     last_idle_jiffies: u64,
     prev_jiffies: std.AutoHashMapUnmanaged(Pid, u64), // per-process bookkeeping for enumerate cpu%
+    cmdline_cache: std.AutoHashMapUnmanaged(Pid, []const u8), // cache for process cmdlines
 
     // Sub-second sample state — tracks one PID at a time.
     sample_pid: Pid,
@@ -478,6 +479,7 @@ pub const Linux = struct {
             .last_total_jiffies = 0,
             .last_idle_jiffies = 0,
             .prev_jiffies = .{},
+            .cmdline_cache = .{},
             .sample_pid = 0,
             .sample_last_jiffies = 0,
             .sample_last_total = 0,
@@ -500,6 +502,11 @@ pub const Linux = struct {
 
     pub fn deinit(self: *Linux) void {
         self.prev_jiffies.deinit(self.alloc);
+        var it = self.cmdline_cache.iterator();
+        while (it.next()) |entry| {
+            self.alloc.free(entry.value_ptr.*);
+        }
+        self.cmdline_cache.deinit(self.alloc);
         self.alloc.free(self.last_per_cpu);
     }
 
@@ -571,13 +578,25 @@ pub const Linux = struct {
             const user = uid_cache.resolve(uid) catch "";
             const comm_dup = arena.dupe(u8, ps.comm) catch continue;
 
+            const cached_cmdline = if (self.cmdline_cache.get(pid)) |c|
+                c
+            else blk: {
+                const c = readCmdline(self.alloc, pid, ps.comm) catch {
+                    const fallback = self.alloc.dupe(u8, ps.comm) catch ps.comm;
+                    break :blk fallback;
+                };
+                try self.cmdline_cache.put(self.alloc, pid, c);
+                break :blk c;
+            };
+            const cmdline_dup = arena.dupe(u8, cached_cmdline) catch comm_dup;
+
             try table.append(.{
                 .pid = pid,
                 .ppid = ps.ppid,
                 .uid = uid,
                 .user = user,
                 .comm = comm_dup,
-                .cmdline = comm_dup, // US2 will read /proc/<pid>/cmdline properly
+                .cmdline = cmdline_dup,
                 .state = ps.state,
                 .cpu_pct = cpu_pct,
                 .mem_rss_bytes = ps.rss_pages * self.page_size,
@@ -589,6 +608,24 @@ pub const Linux = struct {
                 .last_jiffies = cur_jiffies,
                 .last_sample_ns = utils.nanoTimestamp(),
             });
+        }
+
+        // Garbage collect dead PIDs from caches
+        var dead_pids: std.ArrayList(Pid) = .empty;
+        defer dead_pids.deinit(arena);
+
+        var it = self.cmdline_cache.iterator();
+        while (it.next()) |entry| {
+            const pid = entry.key_ptr.*;
+            if (table.lookup(pid) == null) {
+                dead_pids.append(arena, pid) catch {};
+            }
+        }
+        for (dead_pids.items) |pid| {
+            if (self.cmdline_cache.fetchRemove(pid)) |kv| {
+                self.alloc.free(kv.value);
+            }
+            _ = self.prev_jiffies.remove(pid);
         }
 
         table.sampled_at_ns = utils.nanoTimestamp();
@@ -994,6 +1031,41 @@ pub const Linux = struct {
         out.pid = pid;
     }
 };
+
+fn readCmdline(alloc: std.mem.Allocator, pid: Pid, comm: []const u8) ![]const u8 {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch return try alloc.dupe(u8, comm);
+
+    var buf: [4096]u8 = undefined;
+    const n = readSmallFile(path, &buf) catch 0;
+    if (n == 0) {
+        if (comm.len > 0 and comm[0] == '[') {
+            return try alloc.dupe(u8, comm);
+        }
+        return std.fmt.allocPrint(alloc, "[{s}]", .{comm}) catch try alloc.dupe(u8, comm);
+    }
+
+    var cleaned: std.ArrayList(u8) = .empty;
+    defer cleaned.deinit(alloc);
+
+    const slice = buf[0..n];
+    var i: usize = 0;
+    while (i < slice.len) : (i += 1) {
+        const c = slice[i];
+        if (c == 0) {
+            if (i + 1 < slice.len and slice[i + 1] != 0) {
+                try cleaned.append(alloc, ' ');
+            }
+        } else {
+            try cleaned.append(alloc, c);
+        }
+    }
+
+    if (cleaned.items.len == 0) {
+        return try alloc.dupe(u8, comm);
+    }
+    return try cleaned.toOwnedSlice(alloc);
+}
 
 fn classifyFd(target: []const u8) FdKind {
     if (std.mem.startsWith(u8, target, "socket:")) return .socket;
