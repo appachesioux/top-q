@@ -84,9 +84,9 @@ pub const Filter = struct {
         if (self.len == 0) return true;
         const needle = self.text();
         return switch (self.field) {
-            .command => containsCI(p.comm, needle),
+            .command => containsCI(p.cmdline, needle),
             .user => containsCI(p.user, needle),
-            .any => containsCI(p.comm, needle) or containsCI(p.user, needle),
+            .any => containsCI(p.cmdline, needle) or containsCI(p.user, needle),
         };
     }
 };
@@ -171,3 +171,27 @@ pub const ViewState = struct {
         if (self.flash_ttl_ticks == 0) self.flash_len = 0;
     }
 };
+
+test "command filter searches the displayed full command line" {
+    const p: process.Process = .{
+        .pid = 42,
+        .ppid = 1,
+        .uid = 1000,
+        .user = "alice",
+        .comm = "python",
+        .cmdline = "python /srv/report-worker.py --daily",
+        .state = .sleeping,
+        .cpu_pct = 0,
+        .mem_rss_bytes = 0,
+        .mem_vsz_bytes = 0,
+        .nthreads = 1,
+        .io_read_bytes = 0,
+        .io_write_bytes = 0,
+        .io_available = false,
+        .last_jiffies = 0,
+        .last_sample_ns = 0,
+    };
+    var filter: Filter = .{ .field = .command };
+    for ("REPORT-WORKER") |c| filter.appendChar(c);
+    try std.testing.expect(filter.matches(&p));
+}

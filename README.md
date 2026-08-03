@@ -14,6 +14,8 @@ zig build run -- -u $USER      # pre-filter by user
 
 Navigate with `j`/`k` (or arrows), `g`/`G`, `PgUp`/`PgDn`. Sort with `s` (cycle) and `r` (reverse). Filter with `/`, clear with `\`. Send a signal with `K` (confirmation required). Help with `?` or `F1`. Quit with `q`.
 
+The process list receives most of the available vertical space. On high-core-count systems, the CPU panel expands or switches to a compact grid so every logical CPU remains visible.
+
 ## Stack
 
 - **Zig 0.16** with **libvaxis** (terminal rendering)
@@ -28,6 +30,7 @@ zig build                          # debug build
 zig build -Doptimize=ReleaseSmall  # release
 zig build run                      # run directly
 zig build test                     # parser unit tests
+zig build bench                    # synthetic 100/1k/10k process refresh benchmark
 ```
 
 Release binary lands in `zig-out/bin/top-q-linux` (currently ~370 KB).
@@ -43,5 +46,3 @@ top-q [options]
   -u, --user <name>    Pre-apply user filter at startup
       --no-color       Disable colours (also via NO_COLOR env)
 ```
-
-

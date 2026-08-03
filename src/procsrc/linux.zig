@@ -114,19 +114,6 @@ pub fn parsePidIo(buf: []const u8) ?PidIo {
     return .{ .read_bytes = read_bytes.?, .write_bytes = write_bytes.? };
 }
 
-/// /proc/<pid>/status — extracts the real Uid (first column of "Uid:" line).
-pub fn parsePidStatusUid(buf: []const u8) ?u32 {
-    var it = std.mem.splitScalar(u8, buf, '\n');
-    while (it.next()) |line| {
-        if (std.mem.startsWith(u8, line, "Uid:")) {
-            var fields = std.mem.tokenizeAny(u8, line[4..], " \t");
-            const real = fields.next() orelse return null;
-            return std.fmt.parseInt(u32, real, 10) catch null;
-        }
-    }
-    return null;
-}
-
 /// Parsed totals from /proc/stat first line (cpu  ...).
 pub const ProcStatCpu = struct {
     total_jiffies: u64,
@@ -428,10 +415,40 @@ pub fn parseUptime(buf: []const u8) u64 {
 // ============================================================================
 
 pub const Linux = struct {
+    const CPU_FREQ_INTERVAL_NS: i64 = std.time.ns_per_s;
+
+    const StaticSystemInfo = struct {
+        os_name: []const u8,
+        kernel_release: []const u8,
+        host_model: []const u8,
+        cpu_model: []const u8,
+        gpus: []const []const u8,
+
+        fn init(alloc: std.mem.Allocator) StaticSystemInfo {
+            return .{
+                .os_name = parseOsName(alloc),
+                .kernel_release = parseKernelRelease(alloc),
+                .host_model = parseHostModel(alloc),
+                .cpu_model = parseCpuModel(alloc),
+                .gpus = detectGpus(alloc),
+            };
+        }
+
+        fn deinit(self: *StaticSystemInfo, alloc: std.mem.Allocator) void {
+            alloc.free(self.os_name);
+            alloc.free(self.kernel_release);
+            alloc.free(self.host_model);
+            alloc.free(self.cpu_model);
+            for (self.gpus) |gpu| alloc.free(gpu);
+            if (self.gpus.len > 0) alloc.free(self.gpus);
+        }
+    };
+
     alloc: std.mem.Allocator,
     page_size: u64,
     nproc: u32,
-    last_total_jiffies: u64, // for global CPU% (header)
+    last_total_jiffies: u64, // for global CPU% (header) — owned by systemSummary
+    enum_last_total_jiffies: u64, // total-jiffies baseline for per-process CPU% — owned by enumerate
     last_idle_jiffies: u64,
     prev_jiffies: std.AutoHashMapUnmanaged(Pid, u64), // per-process bookkeeping for enumerate cpu%
     cmdline_cache: std.AutoHashMapUnmanaged(Pid, []const u8), // cache for process cmdlines
@@ -448,6 +465,9 @@ pub const Linux = struct {
     last_per_cpu: []PerCpuJiffies, // owned, sized = nproc
     last_disk: Diskstats,
     last_disk_ns: i64,
+    static_info: StaticSystemInfo,
+    cpu_freq_mhz: u32,
+    cpu_freq_sampled_ns: i64,
 
     // ----- Network: primary physical interface bytes counter state -----
     /// Name of the interface we're tracking across calls. Empty on first call
@@ -456,6 +476,9 @@ pub const Linux = struct {
     net_iface_len: u8 = 0,
     last_net: IfaceStats = .{},
     last_net_ns: i64 = 0,
+    net_ip: []const u8 = &.{},
+    net_ip_iface_buf: [16]u8 = undefined,
+    net_ip_iface_len: u8 = 0,
 
     // ----- Disk: sticky mountpoint shown in the disk block -----
     /// Mount path currently shown. "/" by default; cycled by app via cycleDisk().
@@ -469,7 +492,9 @@ pub const Linux = struct {
     pub fn init(alloc: std.mem.Allocator) !Linux {
         const nproc = std.Thread.getCpuCount() catch 1;
         const last_per_cpu = try alloc.alloc(PerCpuJiffies, nproc);
+        errdefer alloc.free(last_per_cpu);
         @memset(last_per_cpu, .{ .total = 0, .idle = 0 });
+        const static_info = StaticSystemInfo.init(alloc);
         var disk_mount_buf: [256]u8 = undefined;
         disk_mount_buf[0] = '/';
         return .{
@@ -477,6 +502,7 @@ pub const Linux = struct {
             .page_size = std.heap.pageSize(),
             .nproc = @intCast(nproc),
             .last_total_jiffies = 0,
+            .enum_last_total_jiffies = 0,
             .last_idle_jiffies = 0,
             .prev_jiffies = .{},
             .cmdline_cache = .{},
@@ -489,10 +515,16 @@ pub const Linux = struct {
             .last_per_cpu = last_per_cpu,
             .last_disk = .{},
             .last_disk_ns = 0,
+            .static_info = static_info,
+            .cpu_freq_mhz = 0,
+            .cpu_freq_sampled_ns = 0,
             .net_iface_buf = undefined,
             .net_iface_len = 0,
             .last_net = .{},
             .last_net_ns = 0,
+            .net_ip = &.{},
+            .net_ip_iface_buf = undefined,
+            .net_ip_iface_len = 0,
             .disk_mount_buf = disk_mount_buf,
             .disk_mount_len = 1,
             .net_cycle_pending = std.atomic.Value(u32).init(0),
@@ -508,6 +540,8 @@ pub const Linux = struct {
         }
         self.cmdline_cache.deinit(self.alloc);
         self.alloc.free(self.last_per_cpu);
+        self.static_info.deinit(self.alloc);
+        if (self.net_ip.len > 0) self.alloc.free(self.net_ip);
     }
 
     /// Request the next sample to advance the network interface to the next
@@ -531,11 +565,15 @@ pub const Linux = struct {
         const stat_n = readSmallFile("/proc/stat", &stat_buf) catch 0;
         const cur_cpu = parseProcStat(stat_buf[0..stat_n]) catch ProcStatCpu{ .total_jiffies = 0, .idle_jiffies = 0 };
 
-        // NOTE: do NOT update self.last_total_jiffies here — that's owned by
-        // systemSummary, which is called right after enumerate in the collector
-        // tick. We just READ it for per-process scaling.
-        const total_delta: u64 = if (cur_cpu.total_jiffies > self.last_total_jiffies)
-            cur_cpu.total_jiffies - self.last_total_jiffies
+        // Per-process CPU% scales against enumerate's OWN jiffies baseline,
+        // independent of systemSummary's last_total_jiffies. The collector
+        // posts summary and table as separate events, so the two run in
+        // arbitrary order — sharing the baseline would let whichever runs first
+        // zero out the other's delta (→ absurd per-process %). The very first
+        // enumerate has an empty prev_jiffies, so CPU% is 0 (btop-style) and
+        // becomes real on the next tick.
+        const total_delta: u64 = if (cur_cpu.total_jiffies > self.enum_last_total_jiffies)
+            cur_cpu.total_jiffies - self.enum_last_total_jiffies
         else
             0;
 
@@ -555,11 +593,18 @@ pub const Linux = struct {
             const n = readSmallFile(stat_path, &pid_stat_buf) catch continue;
             const ps = parsePidStat(pid_stat_buf[0..n]) catch continue;
 
-            // Read /proc/<pid>/status for uid
-            const status_path = std.fmt.bufPrint(&path_buf, "/proc/{d}/status", .{pid}) catch continue;
-            var status_buf: [4096]u8 = undefined;
-            const sn = readSmallFile(status_path, &status_buf) catch 0;
-            const uid: u32 = parsePidStatusUid(status_buf[0..sn]) orelse 0;
+            // uid = owner of the /proc/<pid> directory. A single statx is far
+            // cheaper than reading and parsing the whole /proc/<pid>/status
+            // file, which matters when walking thousands of processes.
+            const dir_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}", .{pid}) catch continue;
+            var stx: std.os.linux.Statx = undefined;
+            const uid: u32 = if (std.os.linux.errno(std.os.linux.statx(
+                std.os.linux.AT.FDCWD,
+                dir_path,
+                std.os.linux.AT.SYMLINK_NOFOLLOW,
+                .{ .UID = true },
+                &stx,
+            )) == .SUCCESS) stx.uid else 0;
 
             // CPU% delta vs previous generation
             const cur_jiffies = ps.utime + ps.stime;
@@ -628,6 +673,7 @@ pub const Linux = struct {
             _ = self.prev_jiffies.remove(pid);
         }
 
+        self.enum_last_total_jiffies = cur_cpu.total_jiffies;
         table.sampled_at_ns = utils.nanoTimestamp();
     }
 
@@ -823,8 +869,7 @@ pub const Linux = struct {
         if (std.os.linux.errno(sf_rc) == .SUCCESS) {
             const bsize: u64 = @intCast(sf.bsize);
             fs_total = sf.blocks * bsize;
-            const free = sf.bavail * bsize;
-            fs_used = if (fs_total > free) fs_total - free else 0;
+            fs_used = fsUsedBytes(sf.blocks, sf.bfree, bsize);
             fs_type = fsTypeName(sf.type);
         }
         const fs_mount_owned: []const u8 = alloc.dupe(u8, cur_path) catch "/";
@@ -833,14 +878,26 @@ pub const Linux = struct {
         var bat_status: []const u8 = "";
         parseBattery(alloc, &bat_pct, &bat_status);
 
-        const cpu_freq_mhz = readCpuFreqMhz(self.nproc);
-        const gpus = detectGpus(alloc);
+        if (self.cpu_freq_sampled_ns == 0 or now_ns - self.cpu_freq_sampled_ns >= CPU_FREQ_INTERVAL_NS) {
+            self.cpu_freq_mhz = readCpuFreqMhz(self.nproc);
+            self.cpu_freq_sampled_ns = now_ns;
+        }
 
-        const net_ip = queryIfaceIp(iface_name_owned, alloc);
-        const os_name = parseOsName(alloc);
-        const kernel_release = parseKernelRelease(alloc);
-        const host_model = parseHostModel(alloc);
-        const cpu_model = parseCpuModel(alloc);
+        const iface_changed = !std.mem.eql(
+            u8,
+            self.net_ip_iface_buf[0..self.net_ip_iface_len],
+            iface_name_owned,
+        );
+        if (iface_changed) {
+            if (self.net_ip.len > 0) self.alloc.free(self.net_ip);
+            self.net_ip = queryIfaceIp(iface_name_owned, self.alloc);
+            if (iface_name_owned.len <= self.net_ip_iface_buf.len) {
+                @memcpy(self.net_ip_iface_buf[0..iface_name_owned.len], iface_name_owned);
+                self.net_ip_iface_len = @intCast(iface_name_owned.len);
+            } else {
+                self.net_ip_iface_len = 0;
+            }
+        }
 
         out.* = .{
             .cpu_pct_total = cpu_pct,
@@ -862,13 +919,13 @@ pub const Linux = struct {
             .net_iface_name = iface_name_owned,
             .net_rx_bps = net_rx_bps,
             .net_tx_bps = net_tx_bps,
-            .net_ip = net_ip,
-            .os_name = os_name,
-            .kernel_release = kernel_release,
-            .host_model = host_model,
-            .cpu_model = cpu_model,
-            .cpu_freq_mhz = cpu_freq_mhz,
-            .gpus = gpus,
+            .net_ip = self.net_ip,
+            .os_name = self.static_info.os_name,
+            .kernel_release = self.static_info.kernel_release,
+            .host_model = self.static_info.host_model,
+            .cpu_model = self.static_info.cpu_model,
+            .cpu_freq_mhz = self.cpu_freq_mhz,
+            .gpus = self.static_info.gpus,
             .battery_pct = bat_pct,
             .battery_status = bat_status,
         };
@@ -1099,6 +1156,14 @@ const Statfs64 = extern struct {
     spare: [4]i64,
 };
 
+/// Bytes occupied by filesystem data. `bfree` includes blocks reserved for
+/// privileged users; using `bavail` here would incorrectly count that reserve
+/// as occupied space and inflate the displayed usage percentage.
+pub fn fsUsedBytes(blocks: u64, bfree: u64, block_size: u64) u64 {
+    const used_blocks = if (blocks > bfree) blocks - bfree else 0;
+    return used_blocks * block_size;
+}
+
 /// Map a statfs `f_type` magic number to a filesystem name. Magics from
 /// linux/magic.h. Returns "" for unknown types (caller hides the label).
 pub fn fsTypeName(magic: i64) []const u8 {
@@ -1124,7 +1189,7 @@ pub fn fsTypeName(magic: i64) []const u8 {
 
 fn parseOsName(alloc: std.mem.Allocator) []const u8 {
     var buf: [2048]u8 = undefined;
-    const n = readSmallFile("/etc/os-release", &buf) catch return "Linux";
+    const n = readSmallFile("/etc/os-release", &buf) catch return alloc.dupe(u8, "Linux") catch &.{};
     const content = buf[0..n];
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -1136,34 +1201,34 @@ fn parseOsName(alloc: std.mem.Allocator) []const u8 {
             return alloc.dupe(u8, val) catch "Linux";
         }
     }
-    return "Linux";
+    return alloc.dupe(u8, "Linux") catch &.{};
 }
 
 fn parseKernelRelease(alloc: std.mem.Allocator) []const u8 {
     var buf: [256]u8 = undefined;
-    const n = readSmallFile("/proc/sys/kernel/osrelease", &buf) catch return "Unknown";
+    const n = readSmallFile("/proc/sys/kernel/osrelease", &buf) catch return alloc.dupe(u8, "Unknown") catch &.{};
     const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
-    return alloc.dupe(u8, trimmed) catch "Unknown";
+    return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "Unknown") catch &.{};
 }
 
 fn parseHostModel(alloc: std.mem.Allocator) []const u8 {
     var buf: [256]u8 = undefined;
     const n = readSmallFile("/sys/class/dmi/id/product_name", &buf) catch {
         const n2 = readSmallFile("/sys/devices/virtual/dmi/id/product_name", &buf) catch {
-            const n3 = readSmallFile("/proc/sys/kernel/hostname", &buf) catch return "Desktop";
+            const n3 = readSmallFile("/proc/sys/kernel/hostname", &buf) catch return alloc.dupe(u8, "Desktop") catch &.{};
             const trimmed = std.mem.trim(u8, buf[0..n3], " \t\r\n");
-            return alloc.dupe(u8, trimmed) catch "Desktop";
+            return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "Desktop") catch &.{};
         };
         const trimmed = std.mem.trim(u8, buf[0..n2], " \t\r\n");
-        return alloc.dupe(u8, trimmed) catch "Desktop";
+        return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "Desktop") catch &.{};
     };
     const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
-    return alloc.dupe(u8, trimmed) catch "Desktop";
+    return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "Desktop") catch &.{};
 }
 
 fn parseCpuModel(alloc: std.mem.Allocator) []const u8 {
     var buf: [8192]u8 = undefined;
-    const n = readSmallFile("/proc/cpuinfo", &buf) catch return "Unknown CPU";
+    const n = readSmallFile("/proc/cpuinfo", &buf) catch return alloc.dupe(u8, "Unknown CPU") catch &.{};
     const content = buf[0..n];
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line| {
@@ -1176,11 +1241,11 @@ fn parseCpuModel(alloc: std.mem.Allocator) []const u8 {
                 if (std.mem.indexOf(u8, model, " with ")) |idx| {
                     model = model[0..idx];
                 }
-                return alloc.dupe(u8, model) catch "Unknown CPU";
+                return alloc.dupe(u8, model) catch alloc.dupe(u8, "Unknown CPU") catch &.{};
             }
         }
     }
-    return "Unknown CPU";
+    return alloc.dupe(u8, "Unknown CPU") catch &.{};
 }
 
 /// DRIVER / PCI_ID / PCI_SLOT_NAME fields of a drm device uevent file.

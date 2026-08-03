@@ -28,7 +28,9 @@ pub const NET_BLOCK_W: u16 = 25;
 /// GPUs add one row each on top of these.
 pub const SYS_FIXED_ROWS: u16 = 6;
 
-pub fn topLayoutHeights(h: u16, w: u16, ncores: u16, ngpus: u16) struct { row1: u16, row2: u16, total: u16 } {
+pub const TopLayoutHeights = struct { row1: u16, row2: u16, total: u16 };
+
+pub fn topLayoutHeights(h: u16, w: u16, ncores: u16, ngpus: u16) TopLayoutHeights {
     // Row 1 is content-driven: tall enough for the full sys block (+2 border
     // rows); the process list gives up the rows (user decision 2026-06-05).
     // Very short terminals keep the old compact height and cut sys content.
@@ -313,7 +315,7 @@ fn drawLabelledBars(
             .col_offset = 0,
         });
         if (r.abs.len > 0) {
-            _ = box.printSegment(.{ .text = r.abs, .style = style.dim_style }, .{
+            _ = box.printSegment(.{ .text = r.abs, .style = style.default_style }, .{
                 .row_offset = @intCast(i),
                 .col_offset = label_w,
             });
@@ -373,7 +375,7 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
                     .style = style.default_style,
                 });
             }
-            _ = box.printSegment(.{ .text = text, .style = style.dim_style }, .{
+            _ = box.printSegment(.{ .text = text, .style = style.default_style }, .{
                 .row_offset = swap_row,
                 .col_offset = 0,
             });

@@ -94,12 +94,20 @@ pub fn main(init: std.process.Init) !void {
         writeStderr(m);
         std.process.exit(2);
     };
-    defer app.deinit();
 
-    app.run() catch |e| {
+    // Do not call process.exit while the application still owns a raw TTY:
+    // process.exit bypasses defer. Capture the error, restore the terminal,
+    // and only then report/exit.
+    const run_error: ?anyerror = blk: {
+        app.run() catch |e| break :blk e;
+        break :blk null;
+    };
+    app.deinit();
+
+    if (run_error) |e| {
         var buf: [128]u8 = undefined;
         const m = std.fmt.bufPrint(&buf, "top-q: runtime error: {s}\n", .{@errorName(e)}) catch "top-q: runtime error\n";
         writeStderr(m);
         std.process.exit(3);
-    };
+    }
 }

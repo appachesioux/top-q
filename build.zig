@@ -41,6 +41,18 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run top-q");
     run_step.dependOn(&run_cmd.step);
 
+    const benchmark = b.addExecutable(.{
+        .name = "top-q-benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const benchmark_cmd = b.addRunArtifact(benchmark);
+    const benchmark_step = b.step("bench", "Benchmark synthetic process-table refreshes");
+    benchmark_step.dependOn(&benchmark_cmd.step);
+
     // -------------------------------------------------------------------
     // Tests
     // -------------------------------------------------------------------
