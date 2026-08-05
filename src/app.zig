@@ -288,6 +288,17 @@ pub const App = struct {
             }
         }
 
+        // Paint the first frame immediately so the top panels (borders,
+        // titles, sys block) appear at t≈0 instead of waiting for the
+        // collector's first event. Values show empty/0 and are replaced when
+        // the first summary event lands. If the terminal size isn't queryable
+        // yet, the queued winsize event paints the initial frame as usual.
+        if (self.tty.getWinsize()) |ws| {
+            try self.vx.resize(self.alloc, self.tty.writer(), ws);
+            self.draw();
+            try self.vx.render(self.tty.writer());
+        } else |_| {}
+
         try self.collector.start();
         return self;
     }

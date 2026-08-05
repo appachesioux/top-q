@@ -625,7 +625,18 @@ pub const Linux = struct {
 
             const cached_cmdline = if (self.cmdline_cache.get(pid)) |c|
                 c
-            else blk: {
+            else if (ps.ppid == 2) blk: {
+                // Kernel threads (children of kthreadd) always have an empty
+                // cmdline — skip the wasted open+read and show "[comm]"
+                // directly. Speeds up the cold enumerate ~2x on typical
+                // systems where kernel threads are most of /proc.
+                const c = std.fmt.allocPrint(self.alloc, "[{s}]", .{ps.comm}) catch fb2: {
+                    const fb = self.alloc.dupe(u8, ps.comm) catch ps.comm;
+                    break :fb2 fb;
+                };
+                try self.cmdline_cache.put(self.alloc, pid, c);
+                break :blk c;
+            } else blk: {
                 const c = readCmdline(self.alloc, pid, ps.comm) catch {
                     const fallback = self.alloc.dupe(u8, ps.comm) catch ps.comm;
                     break :blk fallback;
@@ -1106,26 +1117,27 @@ fn readCmdline(alloc: std.mem.Allocator, pid: Pid, comm: []const u8) ![]const u8
         return std.fmt.allocPrint(alloc, "[{s}]", .{comm}) catch try alloc.dupe(u8, comm);
     }
 
-    var cleaned: std.ArrayList(u8) = .empty;
-    defer cleaned.deinit(alloc);
-
-    const slice = buf[0..n];
+    // NUL → space in place, collapsing consecutive NULs (argv separator);
+    // a single dupe at the end avoids the ArrayList + toOwnedSlice copies.
+    var out_len: usize = 0;
     var i: usize = 0;
-    while (i < slice.len) : (i += 1) {
-        const c = slice[i];
+    while (i < n) : (i += 1) {
+        const c = buf[i];
         if (c == 0) {
-            if (i + 1 < slice.len and slice[i + 1] != 0) {
-                try cleaned.append(alloc, ' ');
+            if (i + 1 < n and buf[i + 1] != 0) {
+                buf[out_len] = ' ';
+                out_len += 1;
             }
         } else {
-            try cleaned.append(alloc, c);
+            buf[out_len] = c;
+            out_len += 1;
         }
     }
 
-    if (cleaned.items.len == 0) {
+    if (out_len == 0) {
         return try alloc.dupe(u8, comm);
     }
-    return try cleaned.toOwnedSlice(alloc);
+    return try alloc.dupe(u8, buf[0..out_len]);
 }
 
 fn classifyFd(target: []const u8) FdKind {
