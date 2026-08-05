@@ -183,6 +183,7 @@ pub const SystemSummary = struct {
     per_cpu: []f32 = &.{},
     mem_used_bytes: u64 = 0,
     mem_total_bytes: u64 = 0,
+    mem_available_bytes: u64 = 0, // MemAvailable
     mem_cache_bytes: u64 = 0, // Buffers + Cached + SReclaimable
     swap_used_bytes: u64 = 0,
     swap_total_bytes: u64 = 0,
@@ -195,6 +196,8 @@ pub const SystemSummary = struct {
     disk_write_bps: u64 = 0,
     fs_root_used_bytes: u64 = 0,
     fs_root_total_bytes: u64 = 0,
+    /// Space available to unprivileged users (statfs bavail) — matches df's Avail.
+    fs_root_avail_bytes: u64 = 0,
     /// Mountpoint currently shown in the disk block. Cyclable via `D`. Arena-owned.
     fs_mount_path: []const u8 = "/",
     /// Filesystem type name ("btrfs", "ext4", ...) of the shown mount; empty

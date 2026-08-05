@@ -183,28 +183,30 @@ fn drawTopPanels(
     const heights = topLayoutHeights(win.height, w, @intCast(s.per_cpu.len), @intCast(s.gpus.len));
     if (heights.total < 6) return;
 
-    // Row 1: sys, mem, disk, net (distributed symmetrically)
+    // Row 1: sys, mem, disk, net — mem/disk carry the longer "used/total ·
+    // avail" rows, so they get extra width at the expense of sys/net.
     const n_blocks: u16 = if (w < 115) 2 else if (w < 150) 3 else 4;
     const base_w = w / n_blocks;
+    const delta: u16 = base_w / 5;
 
-    // 1. sys block
-    const sys_w = base_w;
+    // 1. sys block (shrunk)
+    const sys_w = base_w -| delta;
     drawSysBlock(alloc, win, 0, 0, sys_w, heights.row1, s);
     var x = sys_w;
 
-    // 2. mem block
-    const mem_w = if (n_blocks == 2) w - x else base_w;
+    // 2. mem block (widened)
+    const mem_w = if (n_blocks == 2) w - x else base_w + delta;
     drawMemBlock(alloc, win, x, 0, mem_w, heights.row1, s, sys_history);
     x += mem_w;
 
-    // 3. disk block
+    // 3. disk block (widened)
     if (n_blocks >= 3) {
-        const disk_w = if (n_blocks == 3) w - x else base_w;
+        const disk_w = if (n_blocks == 3) w - x else base_w + delta;
         drawDiskBlock(alloc, win, x, 0, disk_w, heights.row1, s, sys_history);
         x += disk_w;
     }
 
-    // 4. net block
+    // 4. net block (absorbs the remainder — shrunk)
     if (n_blocks >= 4) {
         const net_w = w - x;
         drawNetBlock(alloc, win, x, 0, net_w, heights.row1, s, sys_history);
@@ -348,11 +350,13 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
 
     const used_pct = pctOf(s.mem_used_bytes, s.mem_total_bytes);
     const cache_pct = pctOf(s.mem_cache_bytes, s.mem_total_bytes);
+    const avail_pct = pctOf(s.mem_available_bytes, s.mem_total_bytes);
     const swap_pct = pctOf(s.swap_used_bytes, s.swap_total_bytes);
 
     const rows = [_]LabelledRow{
         .{ .label = "Used:", .pct = used_pct, .abs = absUsedTotal(alloc, s.mem_used_bytes, s.mem_total_bytes) },
         .{ .label = "Cache:", .pct = cache_pct, .abs = absUsedTotal(alloc, s.mem_cache_bytes, s.mem_total_bytes) },
+        .{ .label = "Avail:", .pct = avail_pct, .abs = absUsedTotal(alloc, s.mem_available_bytes, s.mem_total_bytes) },
         .{ .label = "Swap:", .pct = swap_pct, .abs = absUsedTotal(alloc, s.swap_used_bytes, s.swap_total_bytes) },
     };
     drawLabelledBars(alloc, box, &rows);
@@ -364,8 +368,8 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
 
     // If swap is absent, overwrite the swap bar with " (none)" after the label
     // so users can tell the 0% isn't usage but unavailability.
-    if (s.swap_total_bytes == 0 and box.height >= 3) {
-        const swap_row: u16 = 2; // Used=0, Cache=1, Swap=2
+    if (s.swap_total_bytes == 0 and box.height >= 4) {
+        const swap_row: u16 = 3; // Used=0, Cache=1, Avail=2, Swap=3
         const text = " Swap      (none)";
         if (text.len <= box.width) {
             // Clear the bar portion by printing spaces then the "(none)" marker.
@@ -393,6 +397,7 @@ fn drawDiskBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, 
     if (box.height < 1) return;
 
     const root_pct = pctOf(s.fs_root_used_bytes, s.fs_root_total_bytes);
+    const avail_pct = pctOf(s.fs_root_avail_bytes, s.fs_root_total_bytes);
     // Truncate long paths so they fit the 6-col label budget; keep root visible.
     const label = if (s.fs_mount_path.len <= 6) s.fs_mount_path else s.fs_mount_path[s.fs_mount_path.len - 6 ..];
     const rows = [_]LabelledRow{
@@ -401,19 +406,24 @@ fn drawDiskBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, 
             .pct = root_pct,
             .abs = absUsedTotal(alloc, s.fs_root_used_bytes, s.fs_root_total_bytes),
         },
+        .{
+            .label = "Avail:",
+            .pct = avail_pct,
+            .abs = absUsedTotal(alloc, s.fs_root_avail_bytes, s.fs_root_total_bytes),
+        },
     };
     drawLabelledBars(alloc, box, &rows);
 
-    // Throughput lines below the bar.
+    // Throughput lines below the bars.
     var rb: [16]u8 = undefined;
     var wb: [16]u8 = undefined;
     const rd = utils.formatBytes(s.disk_read_bps, &rb);
     const wr = utils.formatBytes(s.disk_write_bps, &wb);
 
-    if (box.height >= 2) {
+    if (box.height >= 3) {
         const t = std.fmt.allocPrint(alloc, " rd {s}/s · wr {s}/s", .{ rd, wr }) catch return;
         _ = box.printSegment(.{ .text = t, .style = style.default_style }, .{
-            .row_offset = 1,
+            .row_offset = 2,
             .col_offset = 0,
         });
     }
