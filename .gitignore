@@ -2,3 +2,5 @@ zig-out/
 .zig-cache/
 zig-pkg/
 /tests
+.deploy-targets
+/0-deploy
