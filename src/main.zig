@@ -16,6 +16,8 @@ const help_text =
     \\  -d, --delay <ms>     Refresh interval in ms (200..10000, default 1500)
     \\  -u, --user <name>    Pre-apply user filter at startup
     \\      --no-color       Disable colours (also via NO_COLOR env)
+    \\      --profile        Show live collection/render timings
+    \\      --no-sync        Disable terminal synchronized-output protocol
     \\
 ;
 
@@ -66,6 +68,10 @@ fn parseArgs(alloc: std.mem.Allocator, init: std.process.Init) !AppOptions {
             opts.initial_user_filter = try alloc.dupe(u8, next);
         } else if (std.mem.eql(u8, arg, "--no-color")) {
             opts.no_color = true;
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            opts.profile = true;
+        } else if (std.mem.eql(u8, arg, "--no-sync")) {
+            opts.no_sync_output = true;
         } else {
             var buf: [128]u8 = undefined;
             const m = std.fmt.bufPrint(&buf, "top-q: unknown argument '{s}' (use --help)\n", .{arg}) catch "top-q: bad args\n";

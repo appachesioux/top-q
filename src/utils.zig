@@ -5,10 +5,34 @@ const ctx = @import("ctx.zig");
 // Time
 // =============================================================================
 
-/// Wall-clock nanoseconds, truncated to i64 (replaces std.time.nanoTimestamp()
-/// which was removed in Zig 0.16). Requires ctx.io initialized.
+/// Monotonic awake-clock nanoseconds, truncated to i64. All callers use this
+/// for elapsed durations, so wall-clock adjustments must not affect samples.
 pub fn nanoTimestamp() i64 {
-    return @intCast(std.Io.Clock.now(.real, ctx.io).toNanoseconds() & std.math.maxInt(i64));
+    return @intCast(std.Io.Clock.now(.awake, ctx.io).toNanoseconds() & std.math.maxInt(i64));
+}
+
+/// Vaxis wraps changed frames in DEC private mode 2026 (synchronized output).
+/// Some terminal/SSH combinations defer presentation of these frames. This
+/// helper removes only those wrappers while preserving the rendered payload.
+pub fn stripTerminalSyncInPlace(buf: []u8) []u8 {
+    const sync_set = "\x1b[?2026h";
+    const sync_reset = "\x1b[?2026l";
+    var read: usize = 0;
+    var write: usize = 0;
+    while (read < buf.len) {
+        if (std.mem.startsWith(u8, buf[read..], sync_set)) {
+            read += sync_set.len;
+            continue;
+        }
+        if (std.mem.startsWith(u8, buf[read..], sync_reset)) {
+            read += sync_reset.len;
+            continue;
+        }
+        buf[write] = buf[read];
+        write += 1;
+        read += 1;
+    }
+    return buf[0..write];
 }
 
 // =============================================================================
@@ -89,6 +113,7 @@ pub const UidCache = struct {
     alloc: std.mem.Allocator,
     passwd_loaded: bool,
     passwd_buf: ?[]const u8,
+    fallbacks: std.ArrayListUnmanaged([]const u8),
 
     pub fn init(alloc: std.mem.Allocator) UidCache {
         return .{
@@ -96,12 +121,15 @@ pub const UidCache = struct {
             .alloc = alloc,
             .passwd_loaded = false,
             .passwd_buf = null,
+            .fallbacks = .empty,
         };
     }
 
     pub fn deinit(self: *UidCache) void {
         self.map.deinit(self.alloc);
         if (self.passwd_buf) |buf| self.alloc.free(buf);
+        for (self.fallbacks.items) |fallback| self.alloc.free(fallback);
+        self.fallbacks.deinit(self.alloc);
     }
 
     fn loadPasswd(self: *UidCache) void {
@@ -131,13 +159,16 @@ pub const UidCache = struct {
         }
     }
 
-    /// Returns username for uid, or a numeric fallback. Returned slice lives
-    /// in the cache's allocator (typically an arena owned by the caller).
+    /// Returns username for uid, or a numeric fallback. Returned slices remain
+    /// stable until deinit, allowing one cache to serve every refresh.
     pub fn resolve(self: *UidCache, uid: u32) ![]const u8 {
         self.loadPasswd();
         if (self.map.get(uid)) |name| return name;
         const fallback = try std.fmt.allocPrint(self.alloc, "{d}", .{uid});
-        self.map.put(self.alloc, uid, fallback) catch {};
+        errdefer self.alloc.free(fallback);
+        try self.fallbacks.append(self.alloc, fallback);
+        errdefer _ = self.fallbacks.pop();
+        try self.map.put(self.alloc, uid, fallback);
         return fallback;
     }
 };
@@ -171,4 +202,9 @@ test "formatDuration" {
     try std.testing.expectEqualStrings("00:00:42", formatDuration(42, &buf));
     try std.testing.expectEqualStrings("01:02:03", formatDuration(3723, &buf));
     try std.testing.expectEqualStrings("2d 03:04", formatDuration(2 * 24 * 3600 + 3 * 3600 + 4 * 60, &buf));
+}
+
+test "stripTerminalSyncInPlace removes only synchronized output wrappers" {
+    var buf = [_]u8{ 0x1b, '[', '?', '2', '0', '2', '6', 'h', 'a', 'b', 'c', 0x1b, '[', '?', '2', '0', '2', '6', 'l' };
+    try std.testing.expectEqualStrings("abc", stripTerminalSyncInPlace(&buf));
 }

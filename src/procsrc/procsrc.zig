@@ -27,7 +27,8 @@ pub const ProcessSource = struct {
     }
 
     /// Refresh `table` with all processes visible to the current user.
-    /// `table` is cleared first; strings are allocated in `table.arena`.
+    /// `table` is cleared first; per-process strings are allocated in its
+    /// arena, while stable usernames may be owned by the backend cache.
     /// CPU% is computed using internal jiffies bookkeeping kept in the
     /// backend across calls — no `prev` needs to be passed in.
     pub fn enumerate(self: *ProcessSource, table: *process.ProcessTable) !void {

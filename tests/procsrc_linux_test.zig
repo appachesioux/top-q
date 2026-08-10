@@ -100,6 +100,19 @@ test "parseLoadavg returns three plausible floats" {
     try std.testing.expect(la[2] >= 0);
 }
 
+test "parseCpuFreqMhz returns the highest core frequency" {
+    const cpuinfo =
+        \\processor : 0
+        \\cpu MHz   : 2194.531
+        \\processor : 1
+        \\cpu MHz   : 3150.875
+        \\processor : 2
+        \\cpu MHz   : invalid
+    ;
+    try std.testing.expectEqual(@as(u32, 3150), linux.parseCpuFreqMhz(cpuinfo));
+    try std.testing.expectEqual(@as(u32, 0), linux.parseCpuFreqMhz("processor : 0\n"));
+}
+
 test "parseUptime returns positive integer" {
     const a = std.testing.allocator;
     const buf = try readFixture(a, "proc_uptime");

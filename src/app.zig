@@ -20,13 +20,7 @@ const Tty = vaxis.Tty;
 
 pub const RefreshPayload = struct {
     table: process.ProcessTable,
-};
-
-/// Posted before the (heavier) process table so the top panels paint first,
-/// htop/btop-style. Owns its own arena (per_cpu/gpus/strings live there).
-pub const SummaryPayload = struct {
     summary: process.SystemSummary,
-    arena: std.heap.ArenaAllocator,
 };
 
 pub const SamplePayload = struct {
@@ -42,7 +36,6 @@ pub const DetailPayload = struct {
 pub const Event = union(enum) {
     key_press: vaxis.Key,
     winsize: vaxis.Winsize,
-    summary: SummaryPayload,
     refresh: RefreshPayload,
     sample: SamplePayload,
     detail: DetailPayload,
@@ -123,8 +116,21 @@ const Collector = struct {
             // The second tick uses a short warmup so deltas populate quickly;
             // steady state uses delay_ms.
             if (!first) {
-                const ms: u64 = if (focus != null) DETAIL_TICK_MS else if (warmup) 100 else self.delay_ms;
-                ctx.io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+                if (focus != null) {
+                    ctx.io.sleep(.fromMilliseconds(@intCast(DETAIL_TICK_MS)), .awake) catch {};
+                } else {
+                    // Keep refresh *starts* at the requested cadence. Sleeping
+                    // the full delay after enumerate made the actual interval
+                    // `delay + procfs scan`, which was very visible on hosts
+                    // with thousands of processes.
+                    const interval_ms: u64 = if (warmup) 100 else self.delay_ms;
+                    const interval_ns: i64 = @intCast(interval_ms * std.time.ns_per_ms);
+                    const before_sleep = utils.nanoTimestamp();
+                    const elapsed_ns = if (before_sleep > last_enum_ns) before_sleep - last_enum_ns else 0;
+                    if (elapsed_ns < interval_ns) {
+                        ctx.io.sleep(.fromNanoseconds(interval_ns - elapsed_ns), .awake) catch {};
+                    }
+                }
                 warmup = false;
             }
             first = false;
@@ -133,23 +139,19 @@ const Collector = struct {
 
             // ----- Refresh at delay_ms cadence -----
             if (focus == null or now - last_enum_ns >= @as(i64, @intCast(self.delay_ms * std.time.ns_per_ms))) {
-                // System summary FIRST (cheap) — posted as its own event so the
-                // top panels paint before the process list, htop/btop-style.
-                // Owns a private arena for per_cpu/gpus/strings.
-                var sum_arena = std.heap.ArenaAllocator.init(self.alloc);
-                var summary: process.SystemSummary = .{};
-                self.source.systemSummary(sum_arena.allocator(), &summary) catch {};
-                self.loop.postEvent(.{ .summary = .{ .summary = summary, .arena = sum_arena } }) catch {
-                    sum_arena.deinit();
-                };
-
-                // Full process table (heavier) second.
+                // Build one coherent snapshot and post one event. Posting the
+                // summary and table separately caused two full terminal frames
+                // per tick, which is especially costly through SSH.
                 var table = process.ProcessTable.init(self.alloc);
                 self.source.enumerate(&table) catch {
                     table.deinit();
                     continue;
                 };
-                self.loop.postEvent(.{ .refresh = .{ .table = table } }) catch {
+                var summary: process.SystemSummary = .{};
+                const summary_started = utils.nanoTimestamp();
+                self.source.systemSummary(table.arena.allocator(), &summary) catch {};
+                table.collect_summary_us = elapsedUs(summary_started, utils.nanoTimestamp());
+                self.loop.postEvent(.{ .refresh = .{ .table = table, .summary = summary } }) catch {
                     table.deinit();
                 };
                 last_enum_ns = now;
@@ -186,6 +188,8 @@ const Collector = struct {
 pub const Options = struct {
     delay_ms: u64 = 1500,
     no_color: bool = false,
+    profile: bool = false,
+    no_sync_output: bool = false,
     initial_user_filter: ?[]const u8 = null,
 };
 
@@ -201,9 +205,6 @@ pub const App = struct {
     have_table: bool,
     table: process.ProcessTable,
     summary: process.SystemSummary,
-    /// Backing arena for `summary`'s owned fields. Freed when a new summary
-    /// event replaces it. Null until the first summary arrives.
-    summary_arena: ?std.heap.ArenaAllocator,
     sorted: std.ArrayListUnmanaged(usize),
 
     detail: ?process.ProcessDetail,
@@ -216,10 +217,17 @@ pub const App = struct {
     /// between frames: vaxis stores slice pointers into the cells we write
     /// and reads them again during `vx.render()`, which runs AFTER draw().
     frame_arena: std.heap.ArenaAllocator,
+    render_output: std.Io.Writer.Allocating,
 
     state: view_mod.ViewState,
     options: Options,
     should_quit: bool,
+    last_apply_us: u64,
+    last_draw_us: u64,
+    last_tty_us: u64,
+    last_tty_bytes: u64,
+    last_refresh_at_ns: i64,
+    last_refresh_gap_us: u64,
 
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*App {
         const self = try alloc.create(App);
@@ -234,14 +242,20 @@ pub const App = struct {
             .have_table = false,
             .table = process.ProcessTable.init(alloc),
             .summary = .{},
-            .summary_arena = null,
             .sorted = .empty,
             .detail = null,
             .system_history = .init(),
             .frame_arena = std.heap.ArenaAllocator.init(alloc),
+            .render_output = std.Io.Writer.Allocating.init(alloc),
             .state = .{},
             .options = opts,
             .should_quit = false,
+            .last_apply_us = 0,
+            .last_draw_us = 0,
+            .last_tty_us = 0,
+            .last_tty_bytes = 0,
+            .last_refresh_at_ns = 0,
+            .last_refresh_gap_us = 0,
         };
 
         // Initialization crosses several resources after Tty.init() switches
@@ -260,6 +274,7 @@ pub const App = struct {
                 self.tty.deinit();
             }
             self.frame_arena.deinit();
+            self.render_output.deinit();
             self.sorted.deinit(alloc);
             self.table.deinit();
             alloc.destroy(self);
@@ -288,15 +303,10 @@ pub const App = struct {
             }
         }
 
-        // Paint the first frame immediately so the top panels (borders,
-        // titles, sys block) appear at t≈0 instead of waiting for the
-        // collector's first event. Values show empty/0 and are replaced when
-        // the first summary event lands. If the terminal size isn't queryable
-        // yet, the queued winsize event paints the initial frame as usual.
+        // Size the backing screens now, but do not paint an empty skeleton.
+        // The first visible frame is the first coherent system snapshot.
         if (self.tty.getWinsize()) |ws| {
             try self.vx.resize(self.alloc, self.tty.writer(), ws);
-            self.draw();
-            try self.vx.render(self.tty.writer());
         } else |_| {}
 
         try self.collector.start();
@@ -312,10 +322,6 @@ pub const App = struct {
         //    otherwise the GPA reports leaks at shutdown.
         while (self.loop.tryEvent() catch null) |event| {
             switch (event) {
-                .summary => |payload| {
-                    var arena = payload.arena;
-                    arena.deinit();
-                },
                 .refresh => |payload| {
                     var t = payload.table;
                     t.deinit();
@@ -328,9 +334,9 @@ pub const App = struct {
             }
         }
 
-        if (self.summary_arena) |*a| a.deinit();
         if (self.detail) |*d| d.deinit();
         self.frame_arena.deinit();
+        self.render_output.deinit();
         self.sorted.deinit(self.alloc);
         self.table.deinit();
 
@@ -350,16 +356,21 @@ pub const App = struct {
             const event = try self.loop.nextEvent();
             try self.update(event);
 
-            // A collector tick can enqueue summary and process-table events
-            // back-to-back. Apply everything already available before drawing
-            // so one logical refresh normally produces one terminal frame.
-            // Input events are drained too, which keeps bursty key handling
-            // responsive without changing the collector's ownership model.
+            // Apply everything already available before drawing. Input events
+            // are drained too, which keeps bursty key handling responsive
+            // without changing the collector's ownership model.
             while (try self.loop.tryEvent()) |pending| {
                 try self.update(pending);
             }
+            // Avoid presenting a visibly incomplete interface while the first
+            // process/system snapshot is still being collected.
+            if (!self.have_table) continue;
+            const draw_started = utils.nanoTimestamp();
             self.draw();
-            try self.vx.render(self.tty.writer());
+            self.last_draw_us = elapsedUs(draw_started, utils.nanoTimestamp());
+            const tty_started = utils.nanoTimestamp();
+            self.last_tty_bytes = try self.renderFrame();
+            self.last_tty_us = elapsedUs(tty_started, utils.nanoTimestamp());
         }
     }
 
@@ -368,7 +379,6 @@ pub const App = struct {
     fn update(self: *App, event: Event) !void {
         switch (event) {
             .winsize => |ws| try self.vx.resize(self.alloc, self.tty.writer(), ws),
-            .summary => |payload| self.acceptSummary(payload),
             .refresh => |payload| self.acceptRefresh(payload),
             .sample => |payload| self.acceptSample(payload),
             .detail => |payload| self.acceptDetail(payload),
@@ -376,17 +386,16 @@ pub const App = struct {
         }
     }
 
-    fn acceptSummary(self: *App, payload: SummaryPayload) void {
-        // Replace the summary and its backing arena; history keeps only scalars.
-        if (self.summary_arena) |*a| a.deinit();
-        self.summary = payload.summary;
-        self.summary_arena = payload.arena;
-        self.system_history.push(&self.summary);
-    }
-
     fn acceptRefresh(self: *App, payload: RefreshPayload) void {
+        const apply_started = utils.nanoTimestamp();
+        if (self.last_refresh_at_ns != 0) {
+            self.last_refresh_gap_us = elapsedUs(self.last_refresh_at_ns, apply_started);
+        }
+        self.last_refresh_at_ns = apply_started;
         self.table.deinit();
         self.table = payload.table;
+        self.summary = payload.summary;
+        self.system_history.push(&self.summary);
         self.have_table = true;
 
         // Detail mode + selected PID disappeared → close detail gracefully
@@ -401,6 +410,7 @@ pub const App = struct {
         self.recompute();
         self.clampScroll();
         self.state.tickFlash();
+        self.last_apply_us = elapsedUs(apply_started, utils.nanoTimestamp());
     }
 
     fn acceptSample(self: *App, payload: SamplePayload) void {
@@ -739,6 +749,13 @@ pub const App = struct {
         }
 
         const focused: ?*const process.Process = if (self.state.selected_pid) |pid| self.table.lookup(pid) else null;
+        const perf: ?render.PerfStats = if (self.options.profile) .{
+            .apply_us = self.last_apply_us,
+            .draw_us = self.last_draw_us,
+            .tty_us = self.last_tty_us,
+            .tty_bytes = self.last_tty_bytes,
+            .refresh_gap_us = self.last_refresh_gap_us,
+        } else null;
 
         switch (self.state.mode) {
             .detail => {
@@ -746,12 +763,33 @@ pub const App = struct {
                     const hist_ptr: ?*const sample_mod.ProcessHistory = if (self.state.detail_history) |*h| h else null;
                     render_detail.draw(a, win, focused, hist_ptr, d, &self.state, self.options.no_color);
                 } else {
-                    render.draw(a, win, &self.table, self.sorted.items, &self.summary, &self.system_history, &self.state, self.options.no_color);
+                    render.draw(a, win, &self.table, self.sorted.items, &self.summary, &self.system_history, &self.state, self.options.no_color, perf);
                 }
             },
-            else => render.draw(a, win, &self.table, self.sorted.items, &self.summary, &self.system_history, &self.state, self.options.no_color),
+            else => render.draw(a, win, &self.table, self.sorted.items, &self.summary, &self.system_history, &self.state, self.options.no_color, perf),
         }
 
         win.hideCursor();
     }
+
+    fn renderFrame(self: *App) !u64 {
+        if (!self.options.no_sync_output) {
+            try self.vx.render(self.tty.writer());
+            return 0;
+        }
+
+        self.render_output.clearRetainingCapacity();
+        try self.vx.render(&self.render_output.writer);
+        const output = utils.stripTerminalSyncInPlace(self.render_output.written());
+        if (output.len > 0) {
+            try self.tty.writer().writeAll(output);
+            try self.tty.writer().flush();
+        }
+        return @intCast(output.len);
+    }
 };
+
+fn elapsedUs(start_ns: i64, end_ns: i64) u64 {
+    if (end_ns <= start_ns) return 0;
+    return @as(u64, @intCast(end_ns - start_ns)) / std.time.ns_per_us;
+}

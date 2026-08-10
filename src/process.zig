@@ -95,7 +95,7 @@ pub const Process = struct {
     pid: Pid,
     ppid: Pid,
     uid: u32,
-    user: []const u8, // resolved via UidCache; lives in ProcessTable.arena
+    user: []const u8, // resolved via source-owned UidCache; stable for app lifetime
     comm: []const u8, // short name (from /proc/<pid>/stat between parens)
     cmdline: []const u8, // full command line (NUL-separated joined with space)
     state: ProcessState,
@@ -127,6 +127,12 @@ pub const ProcessTable = struct {
     alloc: std.mem.Allocator,
     sampled_at_ns: i64,
     generation: u64,
+    collect_total_us: u64,
+    collect_dir_us: u64,
+    collect_read_us: u64,
+    collect_merge_us: u64,
+    collect_summary_us: u64,
+    collect_readers: u8,
 
     pub fn init(alloc: std.mem.Allocator) ProcessTable {
         return .{
@@ -136,6 +142,12 @@ pub const ProcessTable = struct {
             .alloc = alloc,
             .sampled_at_ns = 0,
             .generation = 0,
+            .collect_total_us = 0,
+            .collect_dir_us = 0,
+            .collect_read_us = 0,
+            .collect_merge_us = 0,
+            .collect_summary_us = 0,
+            .collect_readers = 0,
         };
     }
 

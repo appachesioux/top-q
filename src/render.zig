@@ -11,6 +11,14 @@ const graph = @import("graph.zig");
 
 const Window = vaxis.Window;
 
+pub const PerfStats = struct {
+    apply_us: u64 = 0,
+    draw_us: u64 = 0,
+    tty_us: u64 = 0,
+    tty_bytes: u64 = 0,
+    refresh_gap_us: u64 = 0,
+};
+
 pub const MIN_W: u16 = 80;
 pub const MIN_H: u16 = 24;
 
@@ -101,6 +109,7 @@ pub fn draw(
     sys_history: *const sample_mod.SystemHistory,
     state: *const view_mod.ViewState,
     no_color: bool,
+    perf: ?PerfStats,
 ) void {
     const w = win.width;
     const h = win.height;
@@ -134,7 +143,7 @@ pub fn draw(
         drawColumnHeader(alloc, list_box, list_box.width, 0, state, no_color);
         drawList(alloc, list_box, list_box.width, list_box.height, 1, table, procs_sorted, state, summary, no_color);
     }
-    drawStatusBar(alloc, win, w, h, table, procs_sorted, state);
+    drawStatusBar(alloc, win, w, h, table, procs_sorted, state, perf);
 
     if (state.mode == .help) {
         drawHelp(win, w, h);
@@ -1016,6 +1025,7 @@ fn drawStatusBar(
     table: *const process.ProcessTable,
     procs_sorted: []const usize,
     state: *const view_mod.ViewState,
+    perf: ?PerfStats,
 ) void {
     if (h < 2) return;
     const row: u16 = h - 1;
@@ -1050,6 +1060,31 @@ fn drawStatusBar(
     if (state.flash_len > 0) {
         const flash = std.fmt.allocPrint(alloc, " {s} ", .{state.flashText()}) catch return;
         _ = win.printSegment(.{ .text = flash, .style = style.status_style }, .{ .row_offset = row, .col_offset = 0 });
+        return;
+    }
+
+    if (perf) |p| {
+        const text = std.fmt.allocPrint(
+            alloc,
+            " PERF gap {d:.1}ms · proc {d:.1} (dir {d:.1} read {d:.1}/{d}w merge {d:.1}) · summary {d:.1} · apply {d:.1} · draw {d:.1} · tty {d:.1}/{d}B · {d} procs ",
+            .{
+                usToMs(p.refresh_gap_us),
+                usToMs(table.collect_total_us),
+                usToMs(table.collect_dir_us),
+                usToMs(table.collect_read_us),
+                table.collect_readers,
+                usToMs(table.collect_merge_us),
+                usToMs(table.collect_summary_us),
+                usToMs(p.apply_us),
+                usToMs(p.draw_us),
+                usToMs(p.tty_us),
+                p.tty_bytes,
+                table.count(),
+            },
+        ) catch return;
+        const available: usize = if (@as(usize, w) > ver.len) @as(usize, w) - ver.len else 0;
+        const shown = text[0..@min(text.len, available)];
+        _ = win.printSegment(.{ .text = shown, .style = style.status_style }, .{ .row_offset = row, .col_offset = 0 });
         return;
     }
 
@@ -1106,6 +1141,10 @@ fn drawStatusBar(
             .col_offset = c,
         });
     }
+}
+
+fn usToMs(us: u64) f64 {
+    return @as(f64, @floatFromInt(us)) / 1000.0;
 }
 
 const help_lines = [_][]const u8{

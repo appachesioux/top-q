@@ -411,6 +411,140 @@ pub fn parseUptime(buf: []const u8) u64 {
 }
 
 // ============================================================================
+// Parallel /proc process snapshot
+// ============================================================================
+
+const ProcessMeta = struct {
+    starttime: u64,
+    uid: u32,
+    cmdline: []const u8,
+};
+
+/// Reading one process requires multiple procfs operations.  Keep those
+/// operations outside ProcessTable so workers only write to their own slot;
+/// all allocator/hash-map work is still merged by the collector thread.
+const RawProcess = struct {
+    valid: bool = false,
+    meta_cached: bool = false,
+    pid: Pid = 0,
+    ppid: Pid = 0,
+    uid: u32 = 0,
+    state: ProcessState = .unknown,
+    utime: u64 = 0,
+    stime: u64 = 0,
+    num_threads: u32 = 0,
+    starttime: u64 = 0,
+    vsize: u64 = 0,
+    rss_pages: u64 = 0,
+    comm_buf: [256]u8 = undefined,
+    comm_len: u16 = 0,
+
+    fn comm(self: *const RawProcess) []const u8 {
+        return self.comm_buf[0..self.comm_len];
+    }
+};
+
+const ProcReadWork = struct {
+    dir: std.Io.Dir,
+    pids: []const Pid,
+    out: []RawProcess,
+    meta_cache: *const std.AutoHashMapUnmanaged(Pid, ProcessMeta),
+    next: std.atomic.Value(usize),
+};
+
+/// Eight readers are enough to overlap procfs lookup latency without creating
+/// dozens of short-lived threads on large NUMA servers.
+const MAX_PROC_READERS: usize = 8;
+
+fn elapsedUs(start_ns: i64, end_ns: i64) u64 {
+    if (end_ns <= start_ns) return 0;
+    return @as(u64, @intCast(end_ns - start_ns)) / std.time.ns_per_us;
+}
+
+fn procReadWorker(work: *ProcReadWork) void {
+    while (true) {
+        const index = work.next.fetchAdd(1, .monotonic);
+        if (index >= work.pids.len) return;
+
+        const pid = work.pids[index];
+        var relative_buf: [64]u8 = undefined;
+        const stat_path = std.fmt.bufPrint(&relative_buf, "{d}/stat", .{pid}) catch continue;
+        var stat_buf: [4096]u8 = undefined;
+        const n = readSmallFileAt(work.dir, stat_path, &stat_buf) catch continue;
+        const ps = parsePidStat(stat_buf[0..n]) catch continue;
+
+        const cached_meta = work.meta_cache.get(pid);
+        const meta_cached = cached_meta != null and cached_meta.?.starttime == ps.starttime;
+        const uid: u32 = if (meta_cached)
+            cached_meta.?.uid
+        else blk: {
+            // Resolve the owner relative to the already-open /proc directory.
+            // Existing processes reuse ProcessMeta, so this syscall normally
+            // runs only for newly-created or PID-reused processes.
+            const pid_path = std.fmt.bufPrintZ(&relative_buf, "{d}", .{pid}) catch continue;
+            var stx: std.os.linux.Statx = undefined;
+            break :blk if (std.os.linux.errno(std.os.linux.statx(
+                work.dir.handle,
+                pid_path,
+                std.os.linux.AT.SYMLINK_NOFOLLOW,
+                .{ .UID = true },
+                &stx,
+            )) == .SUCCESS) stx.uid else 0;
+        };
+
+        var raw: RawProcess = .{
+            .valid = true,
+            .meta_cached = meta_cached,
+            .pid = ps.pid,
+            .ppid = ps.ppid,
+            .uid = uid,
+            .state = ps.state,
+            .utime = ps.utime,
+            .stime = ps.stime,
+            .num_threads = ps.num_threads,
+            .starttime = ps.starttime,
+            .vsize = ps.vsize,
+            .rss_pages = ps.rss_pages,
+        };
+        const comm_len = @min(ps.comm.len, raw.comm_buf.len);
+        @memcpy(raw.comm_buf[0..comm_len], ps.comm[0..comm_len]);
+        raw.comm_len = @intCast(comm_len);
+        work.out[index] = raw;
+    }
+}
+
+fn readProcessesParallel(
+    dir: std.Io.Dir,
+    pids: []const Pid,
+    out: []RawProcess,
+    cpu_count: usize,
+    meta_cache: *const std.AutoHashMapUnmanaged(Pid, ProcessMeta),
+) usize {
+    if (pids.len == 0) return 0;
+
+    var work: ProcReadWork = .{
+        .dir = dir,
+        .pids = pids,
+        .out = out,
+        .meta_cache = meta_cache,
+        .next = std.atomic.Value(usize).init(0),
+    };
+
+    const reader_count = @max(@as(usize, 1), @min(MAX_PROC_READERS, @min(cpu_count, pids.len)));
+    var threads: [MAX_PROC_READERS - 1]?std.Thread = @splat(null);
+    var spawned: usize = 0;
+    while (spawned + 1 < reader_count) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, procReadWorker, .{&work}) catch break;
+    }
+
+    // The collector participates too, so even a thread creation failure falls
+    // back to a correct serial scan instead of dropping the refresh.
+    procReadWorker(&work);
+    for (threads[0..spawned]) |thread| thread.?.join();
+    return spawned + 1;
+}
+
+// ============================================================================
 // Linux backend
 // ============================================================================
 
@@ -451,7 +585,8 @@ pub const Linux = struct {
     enum_last_total_jiffies: u64, // total-jiffies baseline for per-process CPU% — owned by enumerate
     last_idle_jiffies: u64,
     prev_jiffies: std.AutoHashMapUnmanaged(Pid, u64), // per-process bookkeeping for enumerate cpu%
-    cmdline_cache: std.AutoHashMapUnmanaged(Pid, []const u8), // cache for process cmdlines
+    process_meta: std.AutoHashMapUnmanaged(Pid, ProcessMeta), // stable PID identity, uid and cmdline
+    uid_cache: utils.UidCache, // /etc/passwd is loaded once, not once per refresh
 
     // Sub-second sample state — tracks one PID at a time.
     sample_pid: Pid,
@@ -505,7 +640,8 @@ pub const Linux = struct {
             .enum_last_total_jiffies = 0,
             .last_idle_jiffies = 0,
             .prev_jiffies = .{},
-            .cmdline_cache = .{},
+            .process_meta = .{},
+            .uid_cache = utils.UidCache.init(alloc),
             .sample_pid = 0,
             .sample_last_jiffies = 0,
             .sample_last_total = 0,
@@ -534,11 +670,12 @@ pub const Linux = struct {
 
     pub fn deinit(self: *Linux) void {
         self.prev_jiffies.deinit(self.alloc);
-        var it = self.cmdline_cache.iterator();
+        var it = self.process_meta.iterator();
         while (it.next()) |entry| {
-            self.alloc.free(entry.value_ptr.*);
+            self.alloc.free(entry.value_ptr.cmdline);
         }
-        self.cmdline_cache.deinit(self.alloc);
+        self.process_meta.deinit(self.alloc);
+        self.uid_cache.deinit();
         self.alloc.free(self.last_per_cpu);
         self.static_info.deinit(self.alloc);
         if (self.net_ip.len > 0) self.alloc.free(self.net_ip);
@@ -556,9 +693,9 @@ pub const Linux = struct {
     }
 
     pub fn enumerate(self: *Linux, table: *ProcessTable) !void {
+        const collect_started_ns = utils.nanoTimestamp();
         table.clear();
         const arena = table.arena.allocator();
-        var uid_cache = utils.UidCache.init(arena);
 
         // Read /proc/stat to compute global jiffies delta for CPU% scaling
         var stat_buf: [4096]u8 = undefined;
@@ -580,36 +717,36 @@ pub const Linux = struct {
         var dir = std.Io.Dir.openDirAbsolute(ctx.io, "/proc", .{ .iterate = true }) catch return error.ProcUnavailable;
         defer dir.close(ctx.io);
 
+        // getdents itself is serial, but the expensive per-PID open/read/statx
+        // work is independent. Snapshot the numeric entries first, then let a
+        // bounded group of readers fill disjoint RawProcess slots.
+        var pids: std.ArrayList(Pid) = .empty;
+        defer pids.deinit(self.alloc);
         var iter = dir.iterate();
         while (iter.next(ctx.io) catch null) |entry| {
             if (entry.kind != .directory) continue;
-            // Filter to numeric names
             const pid = std.fmt.parseInt(Pid, entry.name, 10) catch continue;
+            pids.append(self.alloc, pid) catch return error.OutOfMemory;
+        }
+        const dir_finished_ns = utils.nanoTimestamp();
 
-            // Read /proc/<pid>/stat
-            var path_buf: [64]u8 = undefined;
-            const stat_path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch continue;
-            var pid_stat_buf: [4096]u8 = undefined;
-            const n = readSmallFile(stat_path, &pid_stat_buf) catch continue;
-            const ps = parsePidStat(pid_stat_buf[0..n]) catch continue;
+        const raw_procs = try self.alloc.alloc(RawProcess, pids.items.len);
+        defer self.alloc.free(raw_procs);
+        for (raw_procs) |*raw| raw.* = .{};
+        const reader_count = readProcessesParallel(dir, pids.items, raw_procs, self.nproc, &self.process_meta);
+        const read_finished_ns = utils.nanoTimestamp();
 
-            // uid = owner of the /proc/<pid> directory. A single statx is far
-            // cheaper than reading and parsing the whole /proc/<pid>/status
-            // file, which matters when walking thousands of processes.
-            const dir_path = std.fmt.bufPrintZ(&path_buf, "/proc/{d}", .{pid}) catch continue;
-            var stx: std.os.linux.Statx = undefined;
-            const uid: u32 = if (std.os.linux.errno(std.os.linux.statx(
-                std.os.linux.AT.FDCWD,
-                dir_path,
-                std.os.linux.AT.SYMLINK_NOFOLLOW,
-                .{ .UID = true },
-                &stx,
-            )) == .SUCCESS) stx.uid else 0;
+        // Use one timestamp for the generation. Calling the clock once per PID
+        // added thousands of unnecessary vDSO calls on process-heavy hosts.
+        const sampled_at_ns = utils.nanoTimestamp();
+        for (raw_procs) |*raw| {
+            if (!raw.valid) continue; // process exited while /proc was scanned
 
             // CPU% delta vs previous generation
-            const cur_jiffies = ps.utime + ps.stime;
+            const cur_jiffies = raw.utime + raw.stime;
             var cpu_pct: f32 = 0;
-            if (self.prev_jiffies.get(pid)) |prev_j| {
+            if (raw.meta_cached and self.prev_jiffies.get(raw.pid) != null) {
+                const prev_j = self.prev_jiffies.get(raw.pid).?;
                 if (cur_jiffies >= prev_j and total_delta > 0) {
                     const proc_delta: u64 = cur_jiffies - prev_j;
                     const num: f64 = @floatFromInt(proc_delta);
@@ -617,52 +754,61 @@ pub const Linux = struct {
                     cpu_pct = @floatCast(num / den * @as(f64, @floatFromInt(self.nproc)) * 100.0);
                 }
             }
-            try self.prev_jiffies.put(self.alloc, pid, cur_jiffies);
+            try self.prev_jiffies.put(self.alloc, raw.pid, cur_jiffies);
 
-            // user — duplicate into arena so it survives this iteration
-            const user = uid_cache.resolve(uid) catch "";
-            const comm_dup = arena.dupe(u8, ps.comm) catch continue;
+            // UidCache is source-owned and its strings are stable for the
+            // collector lifetime, so /etc/passwd no longer needs to be read and
+            // copied into every ProcessTable generation.
+            const user = self.uid_cache.resolve(raw.uid) catch "";
+            const comm_dup = arena.dupe(u8, raw.comm()) catch continue;
 
-            const cached_cmdline = if (self.cmdline_cache.get(pid)) |c|
-                c
-            else if (ps.ppid == 2) blk: {
-                // Kernel threads (children of kthreadd) always have an empty
-                // cmdline — skip the wasted open+read and show "[comm]"
-                // directly. Speeds up the cold enumerate ~2x on typical
-                // systems where kernel threads are most of /proc.
-                const c = std.fmt.allocPrint(self.alloc, "[{s}]", .{ps.comm}) catch fb2: {
-                    const fb = self.alloc.dupe(u8, ps.comm) catch ps.comm;
-                    break :fb2 fb;
+            const cached_cmdline = if (raw.meta_cached)
+                self.process_meta.get(raw.pid).?.cmdline
+            else blk: {
+                const c = if (raw.ppid == 2)
+                    // Kernel threads (children of kthreadd) always have an empty
+                    // cmdline — skip the wasted open+read and show "[comm]"
+                    // directly. Speeds up the cold enumerate ~2x on typical
+                    // systems where kernel threads are most of /proc.
+                    try std.fmt.allocPrint(self.alloc, "[{s}]", .{raw.comm()})
+                else
+                    readCmdlineAt(dir, self.alloc, raw.pid, raw.comm()) catch try self.alloc.dupe(u8, raw.comm());
+
+                const old_meta = self.process_meta.fetchPut(self.alloc, raw.pid, .{
+                    .starttime = raw.starttime,
+                    .uid = raw.uid,
+                    .cmdline = c,
+                }) catch |err| {
+                    self.alloc.free(c);
+                    return err;
                 };
-                try self.cmdline_cache.put(self.alloc, pid, c);
-                break :blk c;
-            } else blk: {
-                const c = readCmdline(self.alloc, pid, ps.comm) catch {
-                    const fallback = self.alloc.dupe(u8, ps.comm) catch ps.comm;
-                    break :blk fallback;
-                };
-                try self.cmdline_cache.put(self.alloc, pid, c);
+                if (old_meta) |old| {
+                    // Same numeric PID, different starttime: replace stale
+                    // identity. The baseline was overwritten above after the
+                    // stale value was deliberately ignored for this sample.
+                    self.alloc.free(old.value.cmdline);
+                }
                 break :blk c;
             };
             const cmdline_dup = arena.dupe(u8, cached_cmdline) catch comm_dup;
 
             try table.append(.{
-                .pid = pid,
-                .ppid = ps.ppid,
-                .uid = uid,
+                .pid = raw.pid,
+                .ppid = raw.ppid,
+                .uid = raw.uid,
                 .user = user,
                 .comm = comm_dup,
                 .cmdline = cmdline_dup,
-                .state = ps.state,
+                .state = raw.state,
                 .cpu_pct = cpu_pct,
-                .mem_rss_bytes = ps.rss_pages * self.page_size,
-                .mem_vsz_bytes = ps.vsize,
-                .nthreads = ps.num_threads,
+                .mem_rss_bytes = raw.rss_pages * self.page_size,
+                .mem_vsz_bytes = raw.vsize,
+                .nthreads = raw.num_threads,
                 .io_read_bytes = 0,
                 .io_write_bytes = 0,
                 .io_available = false, // US2 will populate from /proc/<pid>/io
                 .last_jiffies = cur_jiffies,
-                .last_sample_ns = utils.nanoTimestamp(),
+                .last_sample_ns = sampled_at_ns,
             });
         }
 
@@ -670,7 +816,7 @@ pub const Linux = struct {
         var dead_pids: std.ArrayList(Pid) = .empty;
         defer dead_pids.deinit(arena);
 
-        var it = self.cmdline_cache.iterator();
+        var it = self.process_meta.iterator();
         while (it.next()) |entry| {
             const pid = entry.key_ptr.*;
             if (table.lookup(pid) == null) {
@@ -678,14 +824,20 @@ pub const Linux = struct {
             }
         }
         for (dead_pids.items) |pid| {
-            if (self.cmdline_cache.fetchRemove(pid)) |kv| {
-                self.alloc.free(kv.value);
+            if (self.process_meta.fetchRemove(pid)) |kv| {
+                self.alloc.free(kv.value.cmdline);
             }
             _ = self.prev_jiffies.remove(pid);
         }
 
         self.enum_last_total_jiffies = cur_cpu.total_jiffies;
-        table.sampled_at_ns = utils.nanoTimestamp();
+        table.sampled_at_ns = sampled_at_ns;
+        const collect_finished_ns = utils.nanoTimestamp();
+        table.collect_dir_us = elapsedUs(collect_started_ns, dir_finished_ns);
+        table.collect_read_us = elapsedUs(dir_finished_ns, read_finished_ns);
+        table.collect_merge_us = elapsedUs(read_finished_ns, collect_finished_ns);
+        table.collect_total_us = elapsedUs(collect_started_ns, collect_finished_ns);
+        table.collect_readers = @intCast(reader_count);
     }
 
     pub fn systemSummary(self: *Linux, alloc: std.mem.Allocator, out: *SystemSummary) !void {
@@ -892,7 +1044,7 @@ pub const Linux = struct {
         parseBattery(alloc, &bat_pct, &bat_status);
 
         if (self.cpu_freq_sampled_ns == 0 or now_ns - self.cpu_freq_sampled_ns >= CPU_FREQ_INTERVAL_NS) {
-            self.cpu_freq_mhz = readCpuFreqMhz(self.nproc);
+            self.cpu_freq_mhz = readCpuFreqMhz();
             self.cpu_freq_sampled_ns = now_ns;
         }
 
@@ -1104,12 +1256,12 @@ pub const Linux = struct {
     }
 };
 
-fn readCmdline(alloc: std.mem.Allocator, pid: Pid, comm: []const u8) ![]const u8 {
+fn readCmdlineAt(dir: std.Io.Dir, alloc: std.mem.Allocator, pid: Pid, comm: []const u8) ![]const u8 {
     var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/cmdline", .{pid}) catch return try alloc.dupe(u8, comm);
+    const path = std.fmt.bufPrint(&path_buf, "{d}/cmdline", .{pid}) catch return try alloc.dupe(u8, comm);
 
     var buf: [4096]u8 = undefined;
-    const n = readSmallFile(path, &buf) catch 0;
+    const n = readSmallFileAt(dir, path, &buf) catch 0;
     if (n == 0) {
         if (comm.len > 0 and comm[0] == '[') {
             return try alloc.dupe(u8, comm);
@@ -1151,6 +1303,12 @@ fn classifyFd(target: []const u8) FdKind {
 
 fn readSmallFile(path: []const u8, buf: []u8) !usize {
     const file = try std.Io.Dir.openFileAbsolute(ctx.io, path, .{});
+    defer file.close(ctx.io);
+    return try file.readPositionalAll(ctx.io, buf, 0);
+}
+
+fn readSmallFileAt(dir: std.Io.Dir, path: []const u8, buf: []u8) !usize {
+    const file = try dir.openFile(ctx.io, path, .{});
     defer file.close(ctx.io);
     return try file.readPositionalAll(ctx.io, buf, 0);
 }
@@ -1375,21 +1533,36 @@ fn detectGpus(alloc: std.mem.Allocator) []const []const u8 {
     return out;
 }
 
-/// Highest current core frequency in MHz, read from cpufreq sysfs (values are
-/// in kHz). Max across cores shows boost behaviour on heterogeneous CPUs.
-/// Returns 0 when cpufreq is unavailable (caller hides the figure).
-fn readCpuFreqMhz(nproc: u32) u32 {
-    var max_khz: u64 = 0;
-    var cpu: u32 = 0;
-    while (cpu < nproc) : (cpu += 1) {
-        var path_buf: [80]u8 = undefined;
-        const path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/cpufreq/scaling_cur_freq", .{cpu}) catch continue;
-        var buf: [32]u8 = undefined;
-        const n = readSmallFile(path, &buf) catch continue;
-        const khz = std.fmt.parseInt(u64, std.mem.trim(u8, buf[0..n], " \t\r\n"), 10) catch continue;
-        if (khz > max_khz) max_khz = khz;
+/// Extract the highest `cpu MHz` value reported by /proc/cpuinfo.
+/// Keeping this parser separate makes the hot path testable without sysfs.
+pub fn parseCpuFreqMhz(content: []const u8) u32 {
+    var max_mhz: f64 = 0;
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "cpu MHz")) continue;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const value = std.fmt.parseFloat(f64, std.mem.trim(u8, trimmed[colon + 1 ..], " \t\r")) catch continue;
+        if (value > max_mhz) max_mhz = value;
     }
-    return @intCast(max_khz / 1000);
+    if (max_mhz <= 0 or max_mhz > @as(f64, @floatFromInt(std.math.maxInt(u32)))) return 0;
+    return @intFromFloat(max_mhz);
+}
+
+/// Highest current core frequency in MHz. /proc/cpuinfo supplies all cores in
+/// one open/read, avoiding one serial sysfs open per logical CPU. On platforms
+/// that omit `cpu MHz`, sample cpu0 once as a conservative fallback.
+fn readCpuFreqMhz() u32 {
+    var cpuinfo_buf: [512 * 1024]u8 = undefined;
+    if (readSmallFile("/proc/cpuinfo", &cpuinfo_buf)) |n| {
+        const mhz = parseCpuFreqMhz(cpuinfo_buf[0..n]);
+        if (mhz > 0) return mhz;
+    } else |_| {}
+
+    var freq_buf: [32]u8 = undefined;
+    const n = readSmallFile("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", &freq_buf) catch return 0;
+    const khz = std.fmt.parseInt(u64, std.mem.trim(u8, freq_buf[0..n], " \t\r\n"), 10) catch return 0;
+    return @intCast(@min(khz / 1000, std.math.maxInt(u32)));
 }
 
 fn parseBattery(alloc: std.mem.Allocator, pct_out: *?u8, status_out: *[]const u8) void {

@@ -53,6 +53,20 @@ pub fn build(b: *std.Build) void {
     const benchmark_step = b.step("bench", "Benchmark synthetic process-table refreshes");
     benchmark_step.dependOn(&benchmark_cmd.step);
 
+    if (target.result.os.tag == .linux) {
+        const proc_benchmark = b.addExecutable(.{
+            .name = "top-q-proc-benchmark",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/proc_benchmark.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+            }),
+        });
+        const proc_benchmark_cmd = b.addRunArtifact(proc_benchmark);
+        const proc_benchmark_step = b.step("bench-proc", "Benchmark live Linux /proc enumeration");
+        proc_benchmark_step.dependOn(&proc_benchmark_cmd.step);
+    }
+
     // -------------------------------------------------------------------
     // Tests
     // -------------------------------------------------------------------

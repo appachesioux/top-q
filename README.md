@@ -31,9 +31,10 @@ zig build -Doptimize=ReleaseSmall  # release
 zig build run                      # run directly
 zig build test                     # parser unit tests
 zig build bench                    # synthetic 100/1k/10k process refresh benchmark
+zig build bench-proc               # live Linux /proc collection benchmark
 ```
 
-Release binary lands in `zig-out/bin/top-q-linux` (currently ~370 KB).
+Release binary lands in `zig-out/bin/top-q`.
 
 ## CLI
 
@@ -45,4 +46,6 @@ top-q [options]
   -d, --delay <ms>     Refresh interval in ms (200..10000, default 1500)
   -u, --user <name>    Pre-apply user filter at startup
       --no-color       Disable colours (also via NO_COLOR env)
+      --profile        Show live collection/render timings
+      --no-sync        Disable terminal synchronized-output protocol
 ```
