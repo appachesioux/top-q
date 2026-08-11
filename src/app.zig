@@ -57,7 +57,7 @@ const Collector = struct {
     delay_ms: u64,
     focus_pid: std.atomic.Value(u64), // 0 = no detail; else PID
     should_stop: std.atomic.Value(bool),
-    thread: ?std.Thread,
+    worker: ?std.Io.Future(void),
 
     fn init(alloc: std.mem.Allocator, loop: *Loop, delay_ms: u64) !Collector {
         return .{
@@ -67,7 +67,7 @@ const Collector = struct {
             .delay_ms = delay_ms,
             .focus_pid = std.atomic.Value(u64).init(0),
             .should_stop = std.atomic.Value(bool).init(false),
-            .thread = null,
+            .worker = null,
         };
     }
 
@@ -77,14 +77,18 @@ const Collector = struct {
     }
 
     fn start(self: *Collector) !void {
-        self.thread = try std.Thread.spawn(.{}, workerEntry, .{self});
+        self.worker = try ctx.io.concurrent(workerEntry, .{self});
     }
 
     fn stop(self: *Collector) void {
         self.should_stop.store(true, .seq_cst);
-        if (self.thread) |t| {
-            t.join();
-            self.thread = null;
+        if (self.worker) |*w| {
+            // cancel() = await + cancelation request: the worker's next
+            // cancelation point (its sleep) returns error.Canceled instead of
+            // running the interval to completion. Without this, quitting waited
+            // for the rest of the tick — up to delay_ms.
+            w.cancel(ctx.io);
+            self.worker = null;
         }
     }
 
@@ -117,7 +121,7 @@ const Collector = struct {
             // steady state uses delay_ms.
             if (!first) {
                 if (focus != null) {
-                    ctx.io.sleep(.fromMilliseconds(@intCast(DETAIL_TICK_MS)), .awake) catch {};
+                    ctx.io.sleep(.fromMilliseconds(@intCast(DETAIL_TICK_MS)), .awake) catch break;
                 } else {
                     // Keep refresh *starts* at the requested cadence. Sleeping
                     // the full delay after enumerate made the actual interval
@@ -128,10 +132,15 @@ const Collector = struct {
                     const before_sleep = utils.nanoTimestamp();
                     const elapsed_ns = if (before_sleep > last_enum_ns) before_sleep - last_enum_ns else 0;
                     if (elapsed_ns < interval_ns) {
-                        ctx.io.sleep(.fromNanoseconds(interval_ns - elapsed_ns), .awake) catch {};
+                        ctx.io.sleep(.fromNanoseconds(interval_ns - elapsed_ns), .awake) catch break;
                     }
                 }
                 warmup = false;
+                // Re-check before the scan: when stop() arrives while we are
+                // *not* sleeping there is no cancelation point to hit, and the
+                // old code still paid a full enumerate + systemSummary on the
+                // way out — very visible on hosts with thousands of processes.
+                if (self.should_stop.load(.seq_cst)) break;
             }
             first = false;
 
@@ -590,15 +599,19 @@ pub const App = struct {
     // ------------- key handling -------------
 
     fn handleKey(self: *App, key: vaxis.Key) !void {
+        // Ctrl+C quits from every mode, help included. It has to be tested
+        // before the help branch, which otherwise swallows it as one more
+        // "press any key to close" key.
+        if (key.matches('c', .{ .ctrl = true })) {
+            self.should_quit = true;
+            return;
+        }
+
         if (self.state.mode == .help) {
             self.handleHelpKey(key);
             return;
         }
 
-        if (key.matches('c', .{ .ctrl = true })) {
-            self.should_quit = true;
-            return;
-        }
         if (key.matches(vaxis.Key.f1, .{})) {
             self.state.prev_mode = self.state.mode;
             self.state.help_scroll = 0;
