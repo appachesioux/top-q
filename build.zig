@@ -106,5 +106,21 @@ pub fn build(b: *std.Build) void {
             }),
         });
         test_step.dependOn(&b.addRunArtifact(linux_tests).step);
+
+        // Tests embedded in src/ (view.zig, process.zig, ...). These only run
+        // when lib.zig is the *root* module of a test artifact — importing it
+        // as a named module, like linux_tests does, never runs them.
+        const lib_tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/lib.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "vaxis", .module = vaxis_dep.module("vaxis") },
+                    .{ .name = "build_options", .module = options.createModule() },
+                },
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     }
 }

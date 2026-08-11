@@ -450,11 +450,15 @@ pub const App = struct {
     }
 
     fn handleSignalConfirmKey(self: *App, key: vaxis.Key) !void {
-        if (key.matches(vaxis.Key.tab, .{})) {
-            self.state.pending_signal = self.state.pending_signal.cycle();
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{}) or key.matches(vaxis.Key.tab, .{})) {
+            self.state.pending_signal = self.state.pending_signal.next();
             return;
         }
-        if (key.matches('y', .{}) or key.matches('Y', .{})) {
+        if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            self.state.pending_signal = self.state.pending_signal.prev();
+            return;
+        }
+        if (key.matches('y', .{}) or key.matches('Y', .{}) or key.matches(vaxis.Key.enter, .{})) {
             const pid = self.state.selected_pid orelse {
                 self.state.mode = self.state.prev_mode;
                 return;
@@ -577,7 +581,7 @@ pub const App = struct {
 
     fn handleKey(self: *App, key: vaxis.Key) !void {
         if (self.state.mode == .help) {
-            self.state.mode = self.state.prev_mode;
+            self.handleHelpKey(key);
             return;
         }
 
@@ -587,6 +591,7 @@ pub const App = struct {
         }
         if (key.matches(vaxis.Key.f1, .{})) {
             self.state.prev_mode = self.state.mode;
+            self.state.help_scroll = 0;
             self.state.mode = .help;
             return;
         }
@@ -595,8 +600,33 @@ pub const App = struct {
             .list => try self.handleListKey(key),
             .detail => try self.handleDetailKey(key),
             .filter_input => try self.handleFilterInputKey(key),
+            .search_input => try self.handleSearchInputKey(key),
             .signal_confirm => try self.handleSignalConfirmKey(key),
             else => {},
+        }
+    }
+
+    /// Scroll keys navigate the help overlay; everything else closes it, which
+    /// keeps the "press any key to close" behaviour for anyone not scrolling.
+    fn handleHelpKey(self: *App, key: vaxis.Key) void {
+        const h = self.vx.window().height;
+        const max_scroll = render.helpMaxScroll(@intCast(h));
+        const page = @max(render.helpViewportRows(@intCast(h)) -| 1, 1);
+
+        if (key.matches('j', .{}) or key.matches(vaxis.Key.down, .{})) {
+            if (self.state.help_scroll < max_scroll) self.state.help_scroll += 1;
+        } else if (key.matches('k', .{}) or key.matches(vaxis.Key.up, .{})) {
+            if (self.state.help_scroll > 0) self.state.help_scroll -= 1;
+        } else if (key.matches(vaxis.Key.page_down, .{}) or key.matches('d', .{ .ctrl = true })) {
+            self.state.help_scroll = @min(self.state.help_scroll + page, max_scroll);
+        } else if (key.matches(vaxis.Key.page_up, .{}) or key.matches('u', .{ .ctrl = true })) {
+            self.state.help_scroll -|= page;
+        } else if (key.matches('g', .{}) or key.matches(vaxis.Key.home, .{})) {
+            self.state.help_scroll = 0;
+        } else if (key.matches('G', .{}) or key.matches(vaxis.Key.end, .{})) {
+            self.state.help_scroll = max_scroll;
+        } else {
+            self.state.mode = self.state.prev_mode;
         }
     }
 
@@ -638,12 +668,134 @@ pub const App = struct {
         } else if (key.matches('\\', .{})) {
             self.state.filter.clear();
             self.recompute();
+        } else if (isShiftF3(key)) {
+            self.repeatSearch(.back);
+        } else if (key.matches(vaxis.Key.f3, .{})) {
+            // F3 opens the prompt; once a term is active it repeats forward,
+            // htop-style. Esc drops the term so F3 prompts again.
+            if (self.state.search.isActive()) {
+                self.repeatSearch(.fwd);
+            } else {
+                self.openSearch();
+            }
+        } else if (key.matches(vaxis.Key.escape, .{})) {
+            self.state.search.clear();
         } else if (key.matches('K', .{})) {
             self.openSignalConfirm();
         } else if (key.matches('n', .{})) {
             self.collector.cycleNet();
         } else if (key.matches('D', .{})) {
             self.collector.cycleDisk();
+        }
+    }
+
+    // ------------- incremental search -------------
+
+    fn openSearch(self: *App) void {
+        self.state.search.clear();
+        self.state.search_no_match = false;
+        self.state.search_restore_pid = self.state.selected_pid;
+        self.state.mode = .search_input;
+    }
+
+    /// Move the selection to the next match without touching the visible set —
+    /// this is what separates search from filter.
+    fn repeatSearch(self: *App, dir: view_mod.SearchDir) void {
+        if (!self.state.search.isActive()) return;
+        const total = self.sorted.items.len;
+        if (total == 0) return;
+        const cur = self.currentSelectedIdx() orelse 0;
+        const start = switch (dir) {
+            .fwd => cur + 1,
+            .back => if (cur == 0) total - 1 else cur - 1,
+        };
+        const hit = view_mod.findNextMatch(
+            self.table.procs.items,
+            self.sorted.items,
+            start,
+            self.state.search.text(),
+            dir,
+        );
+        self.state.search_no_match = hit == null;
+        if (hit) |idx| {
+            self.setSelectionByViewIdx(idx);
+        } else {
+            self.state.setFlash("no match");
+        }
+    }
+
+    /// Re-run the search from the current row (inclusive) after every edit, so
+    /// refining a term that still matches keeps the cursor put.
+    fn searchIncremental(self: *App) void {
+        if (!self.state.search.isActive()) {
+            self.state.search_no_match = false;
+            return;
+        }
+        if (self.sorted.items.len == 0) return;
+        const cur = self.currentSelectedIdx() orelse 0;
+        const hit = view_mod.findNextMatch(
+            self.table.procs.items,
+            self.sorted.items,
+            cur,
+            self.state.search.text(),
+            .fwd,
+        );
+        self.state.search_no_match = hit == null;
+        if (hit) |idx| self.setSelectionByViewIdx(idx);
+    }
+
+    fn selectPid(self: *App, pid: process.Pid) void {
+        for (self.sorted.items, 0..) |real_idx, view_idx| {
+            if (real_idx >= self.table.procs.items.len) continue;
+            if (self.table.procs.items[real_idx].pid == pid) {
+                self.setSelectionByViewIdx(view_idx);
+                return;
+            }
+        }
+    }
+
+    fn handleSearchInputKey(self: *App, key: vaxis.Key) !void {
+        if (key.matches(vaxis.Key.escape, .{})) {
+            // Cancel: drop the term and put the cursor back where it started
+            self.state.search.clear();
+            self.state.search_no_match = false;
+            if (self.state.search_restore_pid) |pid| self.selectPid(pid);
+            self.state.mode = .list;
+            return;
+        }
+        if (key.matches(vaxis.Key.enter, .{})) {
+            // Confirm: term stays active so F3 repeats it from the list
+            self.state.mode = .list;
+            return;
+        }
+        if (isShiftF3(key)) {
+            self.repeatSearch(.back);
+            return;
+        }
+        if (key.matches(vaxis.Key.f3, .{})) {
+            self.repeatSearch(.fwd);
+            return;
+        }
+        if (key.matches(vaxis.Key.backspace, .{})) {
+            self.state.search.backspace();
+            self.searchIncremental();
+            return;
+        }
+        if (key.matches('w', .{ .ctrl = true })) {
+            self.state.search.deleteWord();
+            self.searchIncremental();
+            return;
+        }
+        if (key.matches('u', .{ .ctrl = true })) {
+            self.state.search.clear();
+            self.searchIncremental();
+            return;
+        }
+        if (key.text) |t| {
+            for (t) |c| {
+                if (c >= 0x20 and c < 0x7f) self.state.search.appendChar(c);
+            }
+            self.searchIncremental();
         }
     }
 
@@ -788,6 +940,13 @@ pub const App = struct {
         return @intCast(output.len);
     }
 };
+
+/// Shift-F3 arrives as a modified F3 under the kitty keyboard protocol, but
+/// legacy xterm-style terminals encode shifted F1..F12 as F13..F24 instead.
+/// Accept both so "previous match" works either way.
+fn isShiftF3(key: vaxis.Key) bool {
+    return key.matches(vaxis.Key.f3, .{ .shift = true }) or key.matches(vaxis.Key.f15, .{});
+}
 
 fn elapsedUs(start_ns: i64, end_ns: i64) u64 {
     if (end_ns <= start_ns) return 0;

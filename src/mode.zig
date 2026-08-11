@@ -4,5 +4,6 @@ pub const Mode = enum {
     detail, // reserved for US2
     filter_input, // reserved for US3
     signal_confirm, // reserved for US4
+    search_input, // reserved for US5
     help,
 };

@@ -146,7 +146,7 @@ pub fn draw(
     drawStatusBar(alloc, win, w, h, table, procs_sorted, state, perf);
 
     if (state.mode == .help) {
-        drawHelp(win, w, h);
+        drawHelp(win, w, h, state.help_scroll);
     }
     if (state.mode == .signal_confirm) {
         drawSignalConfirm(alloc, win, w, h, table, state);
@@ -1056,6 +1056,16 @@ fn drawStatusBar(
         return;
     }
 
+    if (state.mode == .search_input) {
+        const miss: []const u8 = if (state.search_no_match) "  (no match)" else "";
+        const text = std.fmt.allocPrint(alloc, " search: {s}_{s}  F3 next · S-F3 prev · Enter ok · Esc cancel ", .{
+            state.search.text(),
+            miss,
+        }) catch return;
+        _ = win.printSegment(.{ .text = text, .style = style.status_style }, .{ .row_offset = row, .col_offset = 0 });
+        return;
+    }
+
     // Transient flash takes precedence over the regular status text
     if (state.flash_len > 0) {
         const flash = std.fmt.allocPrint(alloc, " {s} ", .{state.flashText()}) catch return;
@@ -1096,6 +1106,7 @@ fn drawStatusBar(
         .{ .key = "Enter", .action = " open" },
         .{ .key = "s", .action = " sort" },
         .{ .key = "/", .action = " filter" },
+        .{ .key = "F3", .action = " search" },
         .{ .key = "K", .action = " kill" },
         .{ .key = "F1", .action = " help" },
         .{ .key = "q", .action = " quit" },
@@ -1147,42 +1158,75 @@ fn usToMs(us: u64) f64 {
     return @as(f64, @floatFromInt(us)) / 1000.0;
 }
 
-const help_lines = [_][]const u8{
-    "          top-q — keymap",
+// Help overlay. Two columns, because a keymap you have to scroll through is a
+// worse keymap. MIN_W = 80 is enforced before anything draws, so the two-column
+// layout always fits horizontally; only height can force scrolling.
+const HELP_MAX_W: u16 = 76;
+const HELP_LEFT_COL_W: u16 = 37;
+
+const help_left = [_][]const u8{
+    "NAVIGATION",
+    "  ↓ / j        Move down",
+    "  ↑ / k        Move up",
+    "  PgDn / C-d   Page down",
+    "  PgUp / C-u   Page up",
+    "  g / Home     Top",
+    "  G / End      Bottom",
     "",
-    "  NAVIGATION",
-    "    ↓ / j        Move down",
-    "    ↑ / k        Move up",
-    "    PgDn / C-d   Page down",
-    "    PgUp / C-u   Page up",
-    "    g / Home     Top",
-    "    G / End      Bottom",
+    "LIST",
+    "  Enter / d    Open detail",
+    "  s            Cycle sort column",
+    "  r            Reverse sort dir",
+    "  n            Cycle net iface",
+    "  D            Cycle disk mount",
+    "  q / C-c      Quit",
     "",
-    "  ACTIONS",
-    "    Enter / d    Open detail",
-    "    Tab          (in detail) cycle panel",
-    "    Esc / d / q  (in detail) close",
-    "",
-    "  SORT & FILTER",
-    "    s            Cycle sort column",
-    "    r            Reverse sort direction",
-    "    /            Open filter input",
-    "    \\           Clear active filter",
-    "",
-    "  TOP PANELS",
-    "    n            Cycle network interface",
-    "    D            Cycle disk mountpoint",
-    "",
-    "  SIGNALS",
-    "    K            Send signal (TERM default)",
-    "                 [y] confirm · [Tab] cycle signal",
-    "",
-    "  GENERAL",
-    "    F1           This help",
-    "    q / C-c      Quit",
-    "",
-    "          press any key to close",
+    "DETAIL",
+    "  Tab          Cycle panel",
+    "  j / k        Scroll threads/fds",
+    "  Esc / d / q  Close detail",
 };
+
+const help_right = [_][]const u8{
+    "SEARCH — keeps every row visible",
+    "  F3           Search / next match",
+    "  Shift-F3     Previous match",
+    "  Esc          Clear active search",
+    "  prompt: C-w word · C-u all",
+    "",
+    "FILTER — hides non-matching rows",
+    "  /            Open filter prompt",
+    "  \\            Clear active filter",
+    "  Tab          Field: any/cmd/user",
+    "  prompt: C-w word · C-u all",
+    "",
+    "SIGNALS",
+    "  K            Open signal menu",
+    "  j / k        Pick signal",
+    "  Enter / y    Send",
+    "  HUP INT QUIT KILL USR1 USR2 TERM",
+    "",
+    "GENERAL",
+    "  F1           This help",
+};
+
+/// Content rows the help needs — the taller of the two columns.
+pub fn helpContentRows() usize {
+    return @max(help_left.len, help_right.len);
+}
+
+/// Content rows actually visible: popup minus border (2) and footer (1).
+pub fn helpViewportRows(h: u16) usize {
+    const avail: usize = @as(usize, h) -| 4; // popup is inset 2 rows top and bottom
+    const popup_h = @min(helpContentRows() + 3, avail);
+    return popup_h -| 3;
+}
+
+pub fn helpMaxScroll(h: u16) usize {
+    const content = helpContentRows();
+    const vis = helpViewportRows(h);
+    return if (content > vis) content - vis else 0;
+}
 
 fn drawSignalConfirm(
     alloc: std.mem.Allocator,
@@ -1197,9 +1241,10 @@ fn drawSignalConfirm(
     const comm: []const u8 = if (p) |pp| pp.comm else "?";
     const sig = state.pending_signal;
 
+    // border(2) + title + blank + one row per signal + blank + hint
+    const popup_h: u16 = @intCast(process.Signal.menu.len + 6);
     const popup_w: u16 = @intCast(@min(60, w -| 4));
-    const popup_h: u16 = 5;
-    if (popup_w < 30 or h < popup_h + 4) return;
+    if (popup_w < 30 or h < popup_h + 2) return;
 
     const x_off: i17 = @intCast((w - popup_w) / 2);
     const y_off: i17 = @intCast((h - popup_h) / 2);
@@ -1213,17 +1258,39 @@ fn drawSignalConfirm(
     });
     popup.clear();
 
-    const line1 = std.fmt.allocPrint(alloc, " Send SIG{s} to PID {d} ({s}) ?", .{ sig.name(), pid, comm }) catch return;
-    _ = popup.printSegment(.{ .text = line1, .style = style.title_style }, .{ .row_offset = 0, .col_offset = 1 });
+    const title = std.fmt.allocPrint(alloc, " Signal PID {d} ({s})", .{ pid, comm }) catch return;
+    _ = popup.printSegment(.{ .text = title, .style = style.title_style }, .{ .row_offset = 0, .col_offset = 1 });
 
-    const line2 = " [y] confirm · [Tab] cycle signal · any other key cancel";
-    _ = popup.printSegment(.{ .text = line2, .style = style.default_style }, .{ .row_offset = 2, .col_offset = 1 });
+    const inner_w: u16 = popup_w -| 2;
+    for (process.Signal.menu, 0..) |s, i| {
+        const selected = s == sig;
+        const row: u16 = @intCast(i + 2);
+        const line = std.fmt.allocPrint(alloc, " {s} {d:>2}  SIG{s}", .{
+            if (selected) "▸" else " ",
+            s.number(),
+            s.name(),
+        }) catch continue;
+        const st: vaxis.Style = if (selected) style.selected_bg_style else style.default_style;
+        if (selected) {
+            // Paint the full row so the highlight reads as a selection bar.
+            const pad = std.fmt.allocPrint(alloc, "{s: <[w]}", .{ .s = line, .w = @as(usize, inner_w) }) catch line;
+            _ = popup.printSegment(.{ .text = pad, .style = st }, .{ .row_offset = row, .col_offset = 1 });
+        } else {
+            _ = popup.printSegment(.{ .text = line, .style = st }, .{ .row_offset = row, .col_offset = 1 });
+        }
+    }
+
+    const hint_row: u16 = @intCast(process.Signal.menu.len + 3);
+    const hint = " [j/k] pick · [Enter|y] send · any other key cancel";
+    _ = popup.printSegment(.{ .text = hint, .style = style.default_style }, .{ .row_offset = hint_row, .col_offset = 1 });
 }
 
-fn drawHelp(win: Window, w: u16, h: u16) void {
-    const popup_w: u16 = @intCast(@min(55, w -| 4));
-    const popup_h: u16 = @intCast(@min(help_lines.len + 2, h -| 4));
-    if (popup_w < 30 or popup_h < 6) return;
+fn drawHelp(win: Window, w: u16, h: u16, scroll: usize) void {
+    const popup_w: u16 = @intCast(@min(HELP_MAX_W, w -| 4));
+    const viewport = helpViewportRows(h);
+    if (popup_w < 40 or viewport == 0) return;
+    const popup_h: u16 = @intCast(viewport + 3);
+
     const x_off: i17 = @intCast((w - popup_w) / 2);
     const y_off: i17 = @intCast((h - popup_h) / 2);
 
@@ -1236,10 +1303,67 @@ fn drawHelp(win: Window, w: u16, h: u16) void {
     });
     popup.clear();
 
-    for (help_lines, 0..) |line, i| {
-        if (i >= popup_h -| 2) break;
-        const row: u16 = @intCast(i);
-        const s: vaxis.Style = if (line.len > 0 and line[0] != ' ') style.title_style else style.default_style;
-        _ = popup.printSegment(.{ .text = line, .style = s }, .{ .row_offset = row, .col_offset = 0 });
+    const max_scroll = helpMaxScroll(h);
+    const top = @min(scroll, max_scroll);
+
+    var row: u16 = 0;
+    while (row < viewport) : (row += 1) {
+        const i = top + row;
+        drawHelpCell(popup, &help_left, i, row, 0);
+        drawHelpCell(popup, &help_right, i, row, HELP_LEFT_COL_W);
+    }
+
+    const footer: []const u8 = if (max_scroll > 0)
+        " ↑↓ scroll · any other key closes "
+    else
+        " press any key to close ";
+    _ = popup.printSegment(.{ .text = footer, .style = style.dim_style }, .{
+        .row_offset = @intCast(viewport + 1),
+        .col_offset = 0,
+    });
+}
+
+fn drawHelpCell(popup: Window, col: []const []const u8, i: usize, row: u16, x: u16) void {
+    if (i >= col.len) return;
+    const line = col[i];
+    if (line.len == 0) return;
+    // Section headers sit at column 0; entries are indented.
+    const s: vaxis.Style = if (line[0] != ' ') style.title_style else style.default_style;
+    _ = popup.printSegment(.{ .text = line, .style = s }, .{ .row_offset = row, .col_offset = x });
+}
+
+test "help columns fit inside the enforced minimum width" {
+    // MIN_W = 80 → popup_w = 76 → inner width = 74. Both columns must fit
+    // there, or the two-column layout silently clips.
+    const inner: usize = HELP_MAX_W - 2;
+    for (help_left) |line| {
+        const cols = std.unicode.utf8CountCodepoints(line) catch line.len;
+        try std.testing.expect(cols <= HELP_LEFT_COL_W);
+    }
+    for (help_right) |line| {
+        const cols = std.unicode.utf8CountCodepoints(line) catch line.len;
+        try std.testing.expect(HELP_LEFT_COL_W + cols <= inner);
+    }
+}
+
+test "help scrolls at the minimum terminal height and not when it fits" {
+    // 24 rows is the enforced floor: the overlay must still be usable, with
+    // scrolling picking up whatever does not fit.
+    try std.testing.expect(helpMaxScroll(MIN_H) > 0);
+    try std.testing.expect(helpViewportRows(MIN_H) > 0);
+    try std.testing.expect(helpViewportRows(MIN_H) < helpContentRows());
+
+    // Tall enough to show everything → no scrolling offered.
+    const tall: u16 = @intCast(helpContentRows() + 7);
+    try std.testing.expectEqual(@as(usize, 0), helpMaxScroll(tall));
+    try std.testing.expectEqual(helpContentRows(), helpViewportRows(tall));
+}
+
+test "help viewport never exceeds content, at any height" {
+    var h: u16 = MIN_H;
+    while (h <= 120) : (h += 1) {
+        try std.testing.expect(helpViewportRows(h) <= helpContentRows());
+        // Scrolling to the very end must land exactly on the last row.
+        try std.testing.expectEqual(helpContentRows(), helpViewportRows(h) + helpMaxScroll(h));
     }
 }

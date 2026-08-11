@@ -61,16 +61,27 @@ pub const Signal = enum(c_int) {
         };
     }
 
-    /// Cycle through the user-confirmable signals: TERM → KILL → HUP → INT → TERM.
-    /// (USR1/USR2/QUIT are exposed as values but not in the cycle.)
-    pub fn cycle(self: Signal) Signal {
-        return switch (self) {
-            .term => .kill,
-            .kill => .hup,
-            .hup => .int,
-            .int => .term,
-            else => .term,
-        };
+    /// Every signal offered by the confirm popup, ordered by signal number the
+    /// way htop lists them.
+    pub const menu = [_]Signal{ .hup, .int, .quit, .kill, .usr1, .usr2, .term };
+
+    pub fn number(self: Signal) c_int {
+        return @intFromEnum(self);
+    }
+
+    pub fn menuIndex(self: Signal) usize {
+        for (menu, 0..) |s, i| {
+            if (s == self) return i;
+        }
+        return 0;
+    }
+
+    pub fn next(self: Signal) Signal {
+        return menu[(self.menuIndex() + 1) % menu.len];
+    }
+
+    pub fn prev(self: Signal) Signal {
+        return menu[(self.menuIndex() + menu.len - 1) % menu.len];
     }
 };
 
@@ -280,3 +291,26 @@ pub const ProcessDetail = struct {
         self.arena.deinit();
     }
 };
+
+test "signal menu covers every declared signal" {
+    const fields = @typeInfo(Signal).@"enum".fields;
+    try std.testing.expectEqual(fields.len, Signal.menu.len);
+    inline for (fields) |f| {
+        const s: Signal = @enumFromInt(f.value);
+        var found = false;
+        for (Signal.menu) |m| {
+            if (m == s) found = true;
+        }
+        try std.testing.expect(found);
+    }
+}
+
+test "signal menu navigation wraps in both directions" {
+    const first = Signal.menu[0];
+    const last = Signal.menu[Signal.menu.len - 1];
+    try std.testing.expectEqual(last, first.prev());
+    try std.testing.expectEqual(first, last.next());
+    try std.testing.expectEqual(@as(usize, 0), first.menuIndex());
+    // TERM is the default and must round-trip through the menu
+    try std.testing.expectEqual(Signal.term, Signal.term.next().prev());
+}

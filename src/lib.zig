@@ -4,6 +4,7 @@ pub const utils = @import("utils.zig");
 pub const process = @import("process.zig");
 pub const linux = @import("procsrc/linux.zig");
 pub const render = @import("render.zig");
+pub const view = @import("view.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

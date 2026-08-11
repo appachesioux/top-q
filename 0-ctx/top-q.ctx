@@ -22,12 +22,16 @@ infra:
   dev:    zig build run
   build:  zig build (debug) / -Doptimize=ReleaseSmall (~370 KB binário)
   test:   zig build test (parser unit tests com fixtures /proc/*)
+          GOTCHA: teste embutido em src/*.zig só roda se o arquivo for alcançável a partir do
+          módulo RAIZ de um artefato addTest. Importar lib.zig como módulo nomeado (o que
+          linux_tests faz) NÃO roda os testes dele — por isso existe o artefato lib_tests com
+          root_source_file = src/lib.zig. Arquivo novo com teste: exporte-o em src/lib.zig.
   thread: 1 main (vaxis.Loop, input+render) + 1 collector (refresh ProcessTable + sample subsegundo do PID em foco); comunicação via Loop.postEvent
   estrutura:
     build.zig, build.zig.zon
     src/main.zig            -> entry point, parse args, inicializa ctx
     src/app.zig             -> vaxis.Loop, transições de modo
-    src/mode.zig            -> enum Mode (list/detail/filter_input/signal_confirm/help)
+    src/mode.zig            -> enum Mode (list/detail/filter_input/search_input/signal_confirm/help)
     src/ctx.zig             -> globais de I/O (std.Io, env_map) setadas em main; usadas por toda I/O
     src/lib.zig             -> agregador pra test module reaproveitar imports
     src/render.zig          -> lista, header 3-linhas, 4 blocos superiores, status bar
@@ -39,7 +43,7 @@ infra:
     src/sample.zig          -> ProcessSample, ProcessHistory (4 ring buffers de 120)
     src/graph.zig           -> sparkline Unicode ▁..█
     src/style.zig           -> paleta + gradientFg/gradientStyle
-    src/view.zig            -> SortKey, SortDir, Filter
+    src/view.zig            -> SortKey, SortDir, Filter, Search, findNextMatch
     src/utils.zig           -> RingBuffer, formatBytes, formatDuration, formatPercent, UidCache
     tests/procsrc_linux_test.zig
 
@@ -61,6 +65,7 @@ rules:
   - config-free: sem arquivo de configuração; controle só por flags + env vars
   - keyboard-only: zero dependência de mouse
   - divulgação progressiva: painel detail só do PID em foco, sob demanda
+  - search e filter são recursos distintos: search move a seleção e nunca esconde linhas; filter esconde o que não casa
   - lista ≥75% da altura total da tela
   - CPU% nunca conta iowait como busy; índices ≥8 de /proc/stat são ignorados (guest/guest_nice já em user/nice)
   - "Cached" segue fórmula btop++: Cached - Shmem (sem Buffers, sem SReclaimable)
@@ -80,6 +85,9 @@ comportamentos:
     r              -> reverte direção do sort
     /              -> entra modo filter_input
     \              -> limpa filtro ativo
+    F3             -> sem busca ativa: entra modo search_input; com busca ativa: próximo match
+    Shift-F3       -> match anterior (aceita também F15, encoding legado de xterm)
+    Esc            -> limpa busca ativa (F3 volta a abrir o prompt)
     n              -> cicla iface no bloco NET (wrap)
     D              -> cicla mountpoint no bloco DISK (wrap)
     K              -> entra modo signal_confirm pro PID selecionado
@@ -97,10 +105,26 @@ comportamentos:
     Ctrl-u         -> apaga tudo
     Enter/Tab      -> confirma e volta pra lista (filtro permanece ativo)
     Esc            -> cancela (filtro volta ao estado anterior)
+  modo help (F1):
+    j/k/↑/↓        -> rola 1 linha
+    PgUp/PgDn      -> rola 1 página
+    g/G/Home/End   -> topo/fim
+    qualquer outro -> fecha (mantém o "press any key to close" de quem não rola)
+    layout         -> duas colunas; MIN_W=80 garante que sempre cabem na largura,
+                      só a altura pode exigir scroll (h≥27 mostra tudo; h=24 rola 3 linhas)
+  modo search_input:
+    <chars>        -> busca incremental; salta a seleção pro próximo match, wrap
+    Backspace      -> apaga 1 char
+    Ctrl-w         -> apaga 1 palavra
+    Ctrl-u         -> apaga tudo
+    F3 / Shift-F3  -> próximo / anterior match sem sair do prompt
+    Enter          -> confirma e volta pra lista (busca permanece ativa)
+    Esc            -> cancela; termo é descartado e a seleção volta ao PID de origem
   modo signal_confirm:
-    Tab            -> cicla sinal (TERM → KILL → HUP → INT)
-    y              -> envia sinal; status bar mostra resultado ~5s
+    j/k/↑/↓/Tab    -> navega o menu dos 7 sinais (HUP INT QUIT KILL USR1 USR2 TERM), wrap
+    Enter/y        -> envia sinal; status bar mostra resultado ~5s
     qualquer outro -> cancela
+    default        -> TERM; Signal.menu é a ordem exibida e cobre todo o enum (invariante testada)
   apresentação:
     header 1       -> CPU per-core stripe (gradiente verde→amarelo→vermelho)
     header 2       -> MEM + SWAP barras horizontais
