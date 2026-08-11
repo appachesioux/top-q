@@ -72,6 +72,33 @@ pub const status_key_style: Style = .{
     .bold = true,
 };
 
+/// Text-entry modes repaint the whole status bar in a solid colour, so "you are
+/// typing" is unmistakable and each prompt is told apart at a glance. Purple and
+/// orange are the two palette colours not already used in the bar (yellow =
+/// keys, cyan = titles, green = active sort, red = errors).
+pub const filter_mode_style: Style = .{
+    .fg = .{ .rgb = .{ 40, 42, 54 } }, // Dracula background, as ink
+    .bg = .{ .rgb = .{ 189, 147, 249 } }, // Dracula purple
+    .bold = true,
+};
+
+pub const search_mode_style: Style = .{
+    .fg = .{ .rgb = .{ 40, 42, 54 } },
+    .bg = .{ .rgb = .{ 255, 184, 108 } }, // Dracula orange
+    .bold = true,
+};
+
+/// Same colours as chips on the normal status bar, marking a filter or search
+/// that is still active after you left its prompt.
+pub const filter_chip_style: Style = filter_mode_style;
+pub const search_chip_style: Style = search_mode_style;
+
+/// --no-color fallback for both: reverse video still reads as "different mode".
+pub const mono_mode_style: Style = .{
+    .reverse = true,
+    .bold = true,
+};
+
 pub const border_style: Style = .{
     .fg = .{ .rgb = .{ 98, 114, 164 } }, // brighter than Catppuccin overlay
 };

@@ -143,7 +143,7 @@ pub fn draw(
         drawColumnHeader(alloc, list_box, list_box.width, 0, state, no_color);
         drawList(alloc, list_box, list_box.width, list_box.height, 1, table, procs_sorted, state, summary, no_color);
     }
-    drawStatusBar(alloc, win, w, h, table, procs_sorted, state, perf);
+    drawStatusBar(alloc, win, w, h, table, procs_sorted, state, no_color, perf);
 
     if (state.mode == .help) {
         drawHelp(win, w, h, state.help_scroll);
@@ -1025,6 +1025,7 @@ fn drawStatusBar(
     table: *const process.ProcessTable,
     procs_sorted: []const usize,
     state: *const view_mod.ViewState,
+    no_color: bool,
     perf: ?PerfStats,
 ) void {
     if (h < 2) return;
@@ -1048,21 +1049,37 @@ fn drawStatusBar(
     }
 
     if (state.mode == .filter_input) {
-        const text = std.fmt.allocPrint(alloc, " filter [{s}]: {s}_  Tab field · Enter ok · Esc cancel ", .{
+        const prefix = std.fmt.allocPrint(alloc, " filter [{s}]: ", .{
             view_mod.filterFieldLabel(state.filter.field),
-            state.filter.text(),
         }) catch return;
-        _ = win.printSegment(.{ .text = text, .style = style.status_style }, .{ .row_offset = row, .col_offset = 0 });
+        drawPromptBar(
+            alloc,
+            win,
+            w,
+            row,
+            prefix,
+            state.filter.text(),
+            "  Tab field · Enter ok · Esc cancel ",
+            if (no_color) style.mono_mode_style else style.filter_mode_style,
+        );
         return;
     }
 
     if (state.mode == .search_input) {
-        const miss: []const u8 = if (state.search_no_match) "  (no match)" else "";
-        const text = std.fmt.allocPrint(alloc, " search: {s}_{s}  F3 next · S-F3 prev · Enter ok · Esc cancel ", .{
+        const suffix: []const u8 = if (state.search_no_match)
+            "  no match  ·  F3 next · S-F3 prev · Enter ok · Esc cancel "
+        else
+            "  F3 next · S-F3 prev · Enter ok · Esc cancel ";
+        drawPromptBar(
+            alloc,
+            win,
+            w,
+            row,
+            " search: ",
             state.search.text(),
-            miss,
-        }) catch return;
-        _ = win.printSegment(.{ .text = text, .style = style.status_style }, .{ .row_offset = row, .col_offset = 0 });
+            suffix,
+            if (no_color) style.mono_mode_style else style.search_mode_style,
+        );
         return;
     }
 
@@ -1114,6 +1131,30 @@ fn drawStatusBar(
 
     const right_reserve: u16 = @intCast(ver.len);
     var col: u16 = 1;
+
+    // A confirmed filter or search keeps governing the list (and F3) after its
+    // prompt closes. Without a chip here that state is invisible.
+    const chip_filter = if (no_color) style.mono_mode_style else style.filter_chip_style;
+    const chip_search = if (no_color) style.mono_mode_style else style.search_chip_style;
+
+    if (state.filter.isActive()) {
+        const chip = std.fmt.allocPrint(alloc, " filter[{s}]:{s} ", .{
+            view_mod.filterFieldLabel(state.filter.field),
+            state.filter.text(),
+        }) catch "";
+        if (chip.len > 0) col = drawStatusChip(win, row, col, w, chip, chip_filter) + 1;
+    }
+    if (state.search.isActive()) {
+        const ms = view_mod.matchStats(table.procs.items, procs_sorted, state.search.text(), state.selected_pid);
+        const chip = if (ms.total == 0)
+            std.fmt.allocPrint(alloc, " search:{s} no match ", .{state.search.text()}) catch ""
+        else if (ms.pos == 0)
+            std.fmt.allocPrint(alloc, " search:{s} -/{d} ", .{ state.search.text(), ms.total }) catch ""
+        else
+            std.fmt.allocPrint(alloc, " search:{s} {d}/{d} ", .{ state.search.text(), ms.pos, ms.total }) catch "";
+        if (chip.len > 0) col = drawStatusChip(win, row, col, w, chip, chip_search) + 1;
+    }
+
     for (hints, 0..) |hint, idx| {
         const sep_w: u16 = if (idx == 0) 0 else 3;
         const need: u16 = @as(u16, @intCast(hint.key.len + hint.action.len)) + sep_w;
@@ -1156,6 +1197,43 @@ fn drawStatusBar(
 
 fn usToMs(us: u64) f64 {
     return @as(f64, @floatFromInt(us)) / 1000.0;
+}
+
+/// Repaint the whole status bar in `bar_style` and park the terminal cursor
+/// right after the typed text. A real blinking cursor is the convention every
+/// user already knows for "this is a text field"; a literal `_` is not.
+fn drawPromptBar(
+    alloc: std.mem.Allocator,
+    win: Window,
+    w: u16,
+    row: u16,
+    prefix: []const u8,
+    typed: []const u8,
+    suffix: []const u8,
+    bar_style: vaxis.Style,
+) void {
+    for (0..w) |x| {
+        win.writeCell(@intCast(x), row, .{
+            .char = .{ .grapheme = " ", .width = 1 },
+            .style = bar_style,
+        });
+    }
+
+    const text = std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ prefix, typed, suffix }) catch return;
+    _ = win.printSegment(.{ .text = text, .style = bar_style }, .{ .row_offset = row, .col_offset = 0 });
+
+    // prefix and typed text are ASCII, so byte length is the column count.
+    const cursor_col: u16 = @intCast(@min(prefix.len + typed.len, @as(usize, w) -| 1));
+    win.showCursor(cursor_col, row);
+}
+
+/// Chip marking a filter or search still active after its prompt was confirmed.
+/// Returns the column where the next chip (or the hints) should start.
+fn drawStatusChip(win: Window, row: u16, col: u16, w: u16, text: []const u8, chip_style: vaxis.Style) u16 {
+    const need: u16 = @intCast(text.len);
+    if (col + need >= w) return col;
+    _ = win.printSegment(.{ .text = text, .style = chip_style }, .{ .row_offset = row, .col_offset = col });
+    return col + need;
 }
 
 // Help overlay. Two columns, because a keymap you have to scroll through is a

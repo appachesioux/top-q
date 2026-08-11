@@ -66,6 +66,9 @@ rules:
   - keyboard-only: zero dependência de mouse
   - divulgação progressiva: painel detail só do PID em foco, sob demanda
   - search e filter são recursos distintos: search move a seleção e nunca esconde linhas; filter esconde o que não casa
+  - seleção é rastreada por PID, não por índice; como a lista re-ordena a cada refresh, o viewport
+    precisa re-ancorar na linha selecionada (ensureSelectionVisible) ou ela deriva pra fora da tela
+    sem nunca perder a seleção. Rola o mínimo necessário — sem histerese o viewport pula todo tick
   - lista ≥75% da altura total da tela
   - CPU% nunca conta iowait como busy; índices ≥8 de /proc/stat são ignorados (guest/guest_nice já em user/nice)
   - "Cached" segue fórmula btop++: Cached - Shmem (sem Buffers, sem SReclaimable)
@@ -135,6 +138,13 @@ comportamentos:
     lista          -> altura flexível adaptada ao cabeçalho; PID/USER/CPU%/MEM%/TIME/COMMAND; cor por estado, linha selecionada com bg sutil
     sparklines top -> mem%/disk_bps/net_bps no row inferior de cada bloco (mem em gradiente; disk/net em ciano); 120 samples
     sparklines det -> 4 sparklines (cpu/mem/io_r/io_w) no painel detail; reset ao trocar PID
+    modos de texto -> status bar inteira repintada: filter=roxo, search=laranja (as duas cores da
+                      paleta ainda livres na barra; amarelo=teclas, ciano=títulos, verde=sort ativo,
+                      vermelho=erro). Cursor REAL do terminal via showCursor na posição de digitação
+                      — nada de "_" literal. --no-color cai pra reverse video
+    chips de estado-> filtro/busca confirmados viram chip colorido à esquerda dos hints; o de search
+                      mostra pos/total de matches. Sem isso o termo continua governando o F3 sem
+                      nada na tela indicando que existe
   cli:
     -h/--help            -> ajuda e sai
     -v/--version         -> versão e sai

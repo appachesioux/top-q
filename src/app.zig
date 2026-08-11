@@ -409,6 +409,7 @@ pub const App = struct {
 
         self.recompute();
         self.clampScroll();
+        self.ensureSelectionVisible();
         self.state.tickFlash();
         self.last_apply_us = elapsedUs(apply_started, utils.nanoTimestamp());
     }
@@ -569,12 +570,21 @@ pub const App = struct {
         const real_idx = self.sorted.items[idx];
         self.state.selected_pid = self.table.procs.items[real_idx].pid;
 
-        const visible = self.visibleRows();
-        if (visible == 0) return;
-        if (idx < self.state.scroll_top) self.state.scroll_top = idx;
-        if (idx >= self.state.scroll_top + visible) {
-            self.state.scroll_top = idx + 1 - visible;
-        }
+        self.state.scroll_top = view_mod.scrollToKeepVisible(
+            self.state.scroll_top,
+            idx,
+            self.visibleRows(),
+        );
+    }
+
+    /// The selection is tracked by PID, so every re-sort lands it on a different
+    /// view row while `scroll_top` stays where it was — the highlighted process
+    /// then drifts off screen without ever losing selection. Re-anchor the
+    /// viewport on it after each refresh. No-op when the PID is gone, so a dying
+    /// process doesn't yank the view to the top.
+    fn ensureSelectionVisible(self: *App) void {
+        const pid = self.state.selected_pid orelse return;
+        self.selectPid(pid);
     }
 
     // ------------- key handling -------------
@@ -921,7 +931,12 @@ pub const App = struct {
             else => render.draw(a, win, &self.table, self.sorted.items, &self.summary, &self.system_history, &self.state, self.options.no_color, perf),
         }
 
-        win.hideCursor();
+        // Text-entry modes park a real terminal cursor in the prompt (see
+        // drawPromptBar); everywhere else the cursor would just be noise.
+        switch (self.state.mode) {
+            .filter_input, .search_input => {},
+            else => win.hideCursor(),
+        }
     }
 
     fn renderFrame(self: *App) !u64 {

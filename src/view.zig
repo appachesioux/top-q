@@ -133,6 +133,40 @@ pub const Search = struct {
 
 pub const SearchDir = enum { fwd, back };
 
+/// Smallest scroll adjustment that keeps view row `idx` on screen. Returns the
+/// new `scroll_top`, unchanged when the row is already visible — the hysteresis
+/// is what stops the viewport from lurching on every refresh.
+pub fn scrollToKeepVisible(scroll_top: usize, idx: usize, visible: usize) usize {
+    if (visible == 0) return scroll_top;
+    if (idx < scroll_top) return idx;
+    if (idx >= scroll_top + visible) return idx + 1 - visible;
+    return scroll_top;
+}
+
+/// How many rows the active search matches, and which one the cursor is on.
+/// `pos` is 1-based; 0 means the selection is not itself a match.
+pub const MatchStats = struct { total: usize = 0, pos: usize = 0 };
+
+pub fn matchStats(
+    procs: []const process.Process,
+    sorted: []const usize,
+    needle: []const u8,
+    selected_pid: ?process.Pid,
+) MatchStats {
+    if (needle.len == 0) return .{};
+    var out: MatchStats = .{};
+    for (sorted) |real_idx| {
+        if (real_idx >= procs.len) continue;
+        const p = &procs[real_idx];
+        if (!matchesNeedle(p, needle)) continue;
+        out.total += 1;
+        if (selected_pid) |pid| {
+            if (p.pid == pid) out.pos = out.total;
+        }
+    }
+    return out;
+}
+
 fn matchesNeedle(p: *const process.Process, needle: []const u8) bool {
     return containsCI(p.cmdline, needle) or containsCI(p.comm, needle);
 }
@@ -365,4 +399,99 @@ test "search matches command line as well as comm" {
     search.clear();
     for ("PYTH") |c| search.appendChar(c);
     try std.testing.expect(search.matches(&p));
+}
+
+test "scrollToKeepVisible leaves an already visible row alone" {
+    // Viewport shows rows 10..19. Anything inside must not move the view —
+    // this hysteresis is what keeps the list from lurching every refresh.
+    try std.testing.expectEqual(@as(usize, 10), scrollToKeepVisible(10, 10, 10));
+    try std.testing.expectEqual(@as(usize, 10), scrollToKeepVisible(10, 15, 10));
+    try std.testing.expectEqual(@as(usize, 10), scrollToKeepVisible(10, 19, 10));
+}
+
+test "scrollToKeepVisible scrolls the minimum needed in both directions" {
+    // Row above the viewport → it becomes the first visible row.
+    try std.testing.expectEqual(@as(usize, 7), scrollToKeepVisible(10, 7, 10));
+    try std.testing.expectEqual(@as(usize, 0), scrollToKeepVisible(10, 0, 10));
+
+    // Row below → it becomes the last visible row, not the first.
+    try std.testing.expectEqual(@as(usize, 11), scrollToKeepVisible(10, 20, 10));
+    try std.testing.expectEqual(@as(usize, 91), scrollToKeepVisible(10, 100, 10));
+}
+
+test "scrollToKeepVisible handles the one-row and zero-row viewports" {
+    // visible == 0 means the list has no room; the view must not be touched.
+    try std.testing.expectEqual(@as(usize, 42), scrollToKeepVisible(42, 0, 0));
+    // A single visible row always scrolls exactly onto the target.
+    try std.testing.expectEqual(@as(usize, 5), scrollToKeepVisible(0, 5, 1));
+    try std.testing.expectEqual(@as(usize, 5), scrollToKeepVisible(9, 5, 1));
+}
+
+test "matchStats counts matches and locates the selection among them" {
+    const procs = [_]process.Process{
+        testProc(1, "init", "/sbin/init"),
+        testProc(2, "nginx", "nginx: worker process"),
+        testProc(3, "bash", "-bash"),
+        testProc(4, "nginx", "nginx: master process"),
+        testProc(5, "nginx", "nginx: cache manager"),
+    };
+    const sorted = [_]usize{ 0, 1, 2, 3, 4 };
+
+    // Selection on the first match → 1 of 3.
+    var st = matchStats(&procs, &sorted, "nginx", 2);
+    try std.testing.expectEqual(@as(usize, 3), st.total);
+    try std.testing.expectEqual(@as(usize, 1), st.pos);
+
+    // Selection on the last match → 3 of 3.
+    st = matchStats(&procs, &sorted, "nginx", 5);
+    try std.testing.expectEqual(@as(usize, 3), st.total);
+    try std.testing.expectEqual(@as(usize, 3), st.pos);
+
+    // pos is the ordinal among matches, not the row number.
+    st = matchStats(&procs, &sorted, "nginx", 4);
+    try std.testing.expectEqual(@as(usize, 2), st.pos);
+}
+
+test "matchStats reports pos 0 when the cursor is not on a match" {
+    const procs = [_]process.Process{
+        testProc(1, "init", "/sbin/init"),
+        testProc(2, "nginx", "nginx: worker process"),
+    };
+    const sorted = [_]usize{ 0, 1 };
+
+    // Cursor sits on a non-matching row: there are matches, just not here.
+    var st = matchStats(&procs, &sorted, "nginx", 1);
+    try std.testing.expectEqual(@as(usize, 1), st.total);
+    try std.testing.expectEqual(@as(usize, 0), st.pos);
+
+    // No selection at all.
+    st = matchStats(&procs, &sorted, "nginx", null);
+    try std.testing.expectEqual(@as(usize, 1), st.total);
+    try std.testing.expectEqual(@as(usize, 0), st.pos);
+
+    // Nothing matches.
+    st = matchStats(&procs, &sorted, "postgres", 1);
+    try std.testing.expectEqual(@as(usize, 0), st.total);
+    try std.testing.expectEqual(@as(usize, 0), st.pos);
+}
+
+test "matchStats follows view order, not table order" {
+    const procs = [_]process.Process{
+        testProc(1, "nginx", "nginx: first in table"),
+        testProc(2, "bash", "-bash"),
+        testProc(3, "nginx", "nginx: second in table"),
+    };
+    // Sorted view shows pid 3 before pid 1, so pid 1 is match 2 of 2.
+    const sorted = [_]usize{ 2, 1, 0 };
+    const st = matchStats(&procs, &sorted, "nginx", 1);
+    try std.testing.expectEqual(@as(usize, 2), st.total);
+    try std.testing.expectEqual(@as(usize, 2), st.pos);
+}
+
+test "matchStats treats an empty needle as no search at all" {
+    const procs = [_]process.Process{testProc(1, "init", "/sbin/init")};
+    const sorted = [_]usize{0};
+    const st = matchStats(&procs, &sorted, "", 1);
+    try std.testing.expectEqual(@as(usize, 0), st.total);
+    try std.testing.expectEqual(@as(usize, 0), st.pos);
 }
