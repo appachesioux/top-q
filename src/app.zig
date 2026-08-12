@@ -401,6 +401,20 @@ pub const App = struct {
             self.last_refresh_gap_us = elapsedUs(self.last_refresh_at_ns, apply_started);
         }
         self.last_refresh_at_ns = apply_started;
+
+        // A live sort changes the PID occupying each row. In the ordinary list
+        // keep the cursor at its current screen offset so a falling PID cannot
+        // drag the viewport away from rank #1. Semantic selections (search,
+        // detail and signal confirmation) deliberately keep following the PID.
+        const cursor_offset: ?usize = if (self.state.selected_pid != null)
+            view_mod.viewportOffset(
+                self.state.scroll_top,
+                self.currentSelectedIdx() orelse 0,
+                self.visibleRows(),
+            )
+        else
+            null;
+
         self.table.deinit();
         self.table = payload.table;
         self.summary = payload.summary;
@@ -418,7 +432,11 @@ pub const App = struct {
 
         self.recompute();
         self.clampScroll();
-        self.ensureSelectionVisible();
+        if (self.shouldFollowSelectedPid()) {
+            self.ensureSelectionVisible();
+        } else if (cursor_offset) |offset| {
+            self.restoreSelectionAtViewportOffset(offset);
+        }
         self.state.tickFlash();
         self.last_apply_us = elapsedUs(apply_started, utils.nanoTimestamp());
     }
@@ -586,11 +604,29 @@ pub const App = struct {
         );
     }
 
-    /// The selection is tracked by PID, so every re-sort lands it on a different
-    /// view row while `scroll_top` stays where it was — the highlighted process
-    /// then drifts off screen without ever losing selection. Re-anchor the
-    /// viewport on it after each refresh. No-op when the PID is gone, so a dying
-    /// process doesn't yank the view to the top.
+    fn restoreSelectionAtViewportOffset(self: *App, offset: usize) void {
+        const idx = view_mod.indexAtViewportOffset(
+            self.state.scroll_top,
+            offset,
+            self.visibleRows(),
+            self.sorted.items.len,
+        ) orelse {
+            self.state.selected_pid = null;
+            return;
+        };
+        const real_idx = self.sorted.items[idx];
+        self.state.selected_pid = self.table.procs.items[real_idx].pid;
+    }
+
+    fn shouldFollowSelectedPid(self: *const App) bool {
+        return self.state.search.isActive() or
+            self.state.detail_history != null or
+            self.state.mode == .signal_confirm;
+    }
+
+    /// Searches and process-specific modes carry semantic PID selection, so a
+    /// refresh must keep that process visible. Ordinary list browsing instead
+    /// anchors the cursor by screen row in `acceptRefresh`.
     fn ensureSelectionVisible(self: *App) void {
         const pid = self.state.selected_pid orelse return;
         self.selectPid(pid);

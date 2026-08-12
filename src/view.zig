@@ -143,6 +143,24 @@ pub fn scrollToKeepVisible(scroll_top: usize, idx: usize, visible: usize) usize 
     return scroll_top;
 }
 
+/// Screen-row offset of a selection inside the process viewport. Selections
+/// outside the viewport are clamped to the nearest edge; this also lets a
+/// refresh recover cleanly from an old, already-hidden selection.
+pub fn viewportOffset(scroll_top: usize, idx: usize, visible: usize) usize {
+    if (visible == 0 or idx <= scroll_top) return 0;
+    return @min(idx - scroll_top, visible - 1);
+}
+
+/// View index occupying `offset` after a refresh, without moving the viewport.
+/// Keeping the cursor on a screen row (instead of following its old PID) is
+/// important for live sorts: a process falling in the CPU ranking must not drag
+/// the viewport away from the hottest processes.
+pub fn indexAtViewportOffset(scroll_top: usize, offset: usize, visible: usize, total: usize) ?usize {
+    if (total == 0) return null;
+    const bounded_offset = if (visible == 0) 0 else @min(offset, visible - 1);
+    return @min(scroll_top + bounded_offset, total - 1);
+}
+
 /// How many rows the active search matches, and which one the cursor is on.
 /// `pos` is 1-based; 0 means the selection is not itself a match.
 pub const MatchStats = struct { total: usize = 0, pos: usize = 0 };
@@ -229,6 +247,12 @@ pub const SortCtx = struct {
             .name => std.mem.order(u8, pa.comm, pb.comm),
             .user => std.mem.order(u8, pa.user, pb.user),
         };
+
+        // pdq sort is intentionally unstable. Without an explicit tiebreaker,
+        // the many processes sharing 0% CPU (or the same name/user) can change
+        // places on every /proc enumeration even though their sort value did
+        // not change. PID gives every row a deterministic order.
+        if (ord == .eq) return pa.pid < pb.pid;
         return switch (self.dir) {
             .desc => ord == .gt,
             .asc => ord == .lt,
@@ -425,6 +449,43 @@ test "scrollToKeepVisible handles the one-row and zero-row viewports" {
     // A single visible row always scrolls exactly onto the target.
     try std.testing.expectEqual(@as(usize, 5), scrollToKeepVisible(0, 5, 1));
     try std.testing.expectEqual(@as(usize, 5), scrollToKeepVisible(9, 5, 1));
+}
+
+test "refresh keeps the cursor row without following a reordered PID" {
+    // Before refresh, the cursor is on the first visible (and hottest) row.
+    const offset = viewportOffset(0, 0, 12);
+
+    // Its old PID may fall far down after a CPU re-sort. The replacement
+    // selection remains row zero, so the viewport continues to show rank #1.
+    try std.testing.expectEqual(@as(usize, 0), offset);
+    try std.testing.expectEqual(@as(?usize, 0), indexAtViewportOffset(0, offset, 12, 200));
+}
+
+test "refresh preserves a cursor offset in a scrolled viewport" {
+    const offset = viewportOffset(40, 44, 10);
+    try std.testing.expectEqual(@as(usize, 4), offset);
+    try std.testing.expectEqual(@as(?usize, 44), indexAtViewportOffset(40, offset, 10, 200));
+
+    // A shorter replacement table clamps safely to its final row.
+    try std.testing.expectEqual(@as(?usize, 42), indexAtViewportOffset(40, offset, 10, 43));
+    try std.testing.expectEqual(@as(?usize, null), indexAtViewportOffset(0, 0, 10, 0));
+}
+
+test "CPU sort uses PID as a deterministic tiebreaker" {
+    var procs = [_]process.Process{
+        testProc(30, "c", "c"),
+        testProc(10, "a", "a"),
+        testProc(20, "b", "b"),
+    };
+    procs[0].cpu_pct = 7.5;
+    procs[1].cpu_pct = 7.5;
+    procs[2].cpu_pct = 50.0;
+
+    var sorted = [_]usize{ 0, 1, 2 };
+    const ctx: SortCtx = .{ .procs = &procs, .key = .cpu, .dir = .desc };
+    std.sort.pdq(usize, &sorted, ctx, SortCtx.lessThan);
+
+    try std.testing.expectEqualSlices(usize, &.{ 2, 1, 0 }, &sorted);
 }
 
 test "matchStats counts matches and locates the selection among them" {
