@@ -278,3 +278,23 @@ test "gpuVendorName maps PCI vendor prefixes" {
     try std.testing.expectEqualStrings("", linux.gpuVendorName("1AF4:1050"));
     try std.testing.expectEqualStrings("", linux.gpuVendorName("10D"));
 }
+
+test "enumerateMounts filters pseudo, overlay, EFI, and deduplicates Btrfs subvolumes" {
+    const sample_mounts =
+        "sysfs /sys sysfs rw 0 0\n" ++
+        "proc /proc proc rw 0 0\n" ++
+        "/dev/sdb1 /tpol ext4 rw,relatime 0 0\n" ++
+        "/dev/sda2 /boot/efi vfat rw,relatime 0 0\n" ++
+        "/dev/sda3 / ext4 rw,relatime 0 0\n" ++
+        "overlay /var/lib/docker/overlayfs/123 overlay rw 0 0\n" ++
+        "/dev/sda3 /home ext4 rw,relatime 0 0\n" ++
+        "/dev/nvme0n1p2 /var/tmp btrfs rw,subvol=/@tmp 0 0\n" ++
+        "/dev/nvme0n1p2 /var/log btrfs rw,subvol=/@log 0 0\n";
+
+    var entries: [16]linux.MountEntry = undefined;
+    const n = linux.enumerateMounts(sample_mounts, entries[0..]);
+    try std.testing.expectEqual(@as(u8, 3), n);
+    try std.testing.expectEqualStrings("/", entries[0].path());
+    try std.testing.expectEqualStrings("/tpol", entries[1].path());
+    try std.testing.expectEqualStrings("/var/tmp", entries[2].path());
+}

@@ -1,7 +1,7 @@
 Project Context - ctx
 -----------------------------------
 app-name: top-q
-version: 26.4.10
+version: 26.8.14
 description: TUI de monitoramento de sistema — lista enxuta htop-like + detalhe btop-like via divulgação progressiva
 modulos-iniciais: lista de processos, detalhe sob demanda, painel de sistema, sort/filter, sinais
 plataformas: linux (v1), macos (v2 planejado)

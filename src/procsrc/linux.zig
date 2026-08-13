@@ -253,19 +253,26 @@ const SKIP_FSTYPES = [_][]const u8{
     "fusectl",     "configfs", "mqueue",     "hugetlbfs",       "autofs",
     "binfmt_misc", "pstore",   "bpf",        "rpc_pipefs",      "nsfs",
     "efivarfs",    "ramfs",    "selinuxfs",  "fuse.gvfsd-fuse", "fuse.portal",
-    "squashfs",
+    "squashfs",    "overlay",
 };
 
 pub const MountEntry = struct {
     path_buf: [256]u8 = undefined,
     path_len: u8 = 0,
+    dev_buf: [256]u8 = undefined,
+    dev_len: u8 = 0,
 
     pub fn path(self: *const MountEntry) []const u8 {
         return self.path_buf[0..self.path_len];
     }
+
+    pub fn device(self: *const MountEntry) []const u8 {
+        return self.dev_buf[0..self.dev_len];
+    }
 };
 
-/// Parse `/proc/mounts` into `out`, skipping pseudo filesystems. Returns the
+/// Parse `/proc/mounts` into `out`, skipping pseudo filesystems, duplicate device
+/// subvolumes (e.g. Btrfs @tmp/@log), and EFI boot partitions. Returns the
 /// number of entries written. Caller-provided buffer caps the count.
 pub fn enumerateMounts(buf: []const u8, out: []MountEntry) u8 {
     var n: u8 = 0;
@@ -274,7 +281,7 @@ pub fn enumerateMounts(buf: []const u8, out: []MountEntry) u8 {
         if (n >= out.len) break;
         if (line.len == 0) continue;
         var parts = std.mem.tokenizeScalar(u8, line, ' ');
-        _ = parts.next() orelse continue; // device
+        const device = parts.next() orelse continue;
         const mountpoint = parts.next() orelse continue;
         const fstype = parts.next() orelse continue;
 
@@ -286,11 +293,75 @@ pub fn enumerateMounts(buf: []const u8, out: []MountEntry) u8 {
             }
         }
         if (skip) continue;
+
+        // Skip EFI system partitions and boot loaders
+        if (std.mem.eql(u8, mountpoint, "/boot/efi") or
+            std.mem.eql(u8, mountpoint, "/efi") or
+            std.mem.eql(u8, mountpoint, "/boot"))
+        {
+            continue;
+        }
+
+        // Must be a real block device or real network filesystem
+        if (!std.mem.startsWith(u8, device, "/dev/")) {
+            if (!std.mem.eql(u8, fstype, "nfs") and
+                !std.mem.eql(u8, fstype, "nfs4") and
+                !std.mem.eql(u8, fstype, "cifs") and
+                !std.mem.eql(u8, fstype, "smb3") and
+                !std.mem.eql(u8, fstype, "fuse.sshfs"))
+            {
+                continue;
+            }
+        }
+
         if (mountpoint.len == 0 or mountpoint.len > 255) continue;
+        if (device.len == 0 or device.len > 255) continue;
+
+        // Deduplicate by device and mountpoint:
+        // If the same physical device is mounted at multiple locations (e.g. Btrfs subvolumes),
+        // keep only one entry (preferring "/" if present).
+        var dup_idx: ?usize = null;
+        for (out[0..n], 0..) |existing, i| {
+            if (std.mem.eql(u8, existing.device(), device) or std.mem.eql(u8, existing.path(), mountpoint)) {
+                dup_idx = i;
+                break;
+            }
+        }
+
+        if (dup_idx) |di| {
+            if (std.mem.eql(u8, mountpoint, "/") and !std.mem.eql(u8, out[di].path(), "/")) {
+                @memcpy(out[di].path_buf[0..mountpoint.len], mountpoint);
+                out[di].path_len = @intCast(mountpoint.len);
+            }
+            continue;
+        }
+
         @memcpy(out[n].path_buf[0..mountpoint.len], mountpoint);
         out[n].path_len = @intCast(mountpoint.len);
+        @memcpy(out[n].dev_buf[0..device.len], device);
+        out[n].dev_len = @intCast(device.len);
         n += 1;
     }
+
+    // Ensure "/" is at index 0 if present
+    var root_idx: ?usize = null;
+    for (out[0..n], 0..) |m, i| {
+        if (std.mem.eql(u8, m.path(), "/")) {
+            root_idx = i;
+            break;
+        }
+    }
+    if (root_idx) |ri| {
+        if (ri > 0) {
+            const root_entry = out[ri];
+            var k: usize = ri;
+            while (k > 0) : (k -= 1) {
+                out[k] = out[k - 1];
+            }
+            out[0] = root_entry;
+        }
+    }
+
     return n;
 }
 
@@ -989,55 +1060,73 @@ pub const Linux = struct {
         var mounts: [32]MountEntry = undefined;
         const n_mounts = enumerateMounts(mounts_buf[0..mounts_n], mounts[0..]);
 
+        // Sample all enumerated mountpoints with statfs
+        var sampled_disks_buf: [32]process.DiskMount = undefined;
+        var n_sampled_disks: usize = 0;
+
+        for (mounts[0..n_mounts]) |m| {
+            if (n_sampled_disks >= sampled_disks_buf.len) break;
+            const mpath = m.path();
+            var path_z: [257]u8 = undefined;
+            if (mpath.len > 256) continue;
+            @memcpy(path_z[0..mpath.len], mpath);
+            path_z[mpath.len] = 0;
+
+            var sf: Statfs64 = undefined;
+            const sf_rc = std.os.linux.syscall2(.statfs, @intFromPtr(@as([*:0]const u8, @ptrCast(&path_z))), @intFromPtr(&sf));
+            if (std.os.linux.errno(sf_rc) == .SUCCESS and sf.blocks > 0) {
+                const bsize: u64 = @intCast(sf.bsize);
+                const d_total = sf.blocks * bsize;
+                const d_used = fsUsedBytes(sf.blocks, sf.bfree, bsize);
+                const d_avail = sf.bavail * bsize;
+                const d_type = fsTypeName(sf.type);
+                const d_mount_owned = alloc.dupe(u8, mpath) catch continue;
+
+                sampled_disks_buf[n_sampled_disks] = .{
+                    .mount_path = d_mount_owned,
+                    .fs_type_name = d_type,
+                    .used_bytes = d_used,
+                    .total_bytes = d_total,
+                    .avail_bytes = d_avail,
+                };
+                n_sampled_disks += 1;
+            }
+        }
+
+        const sampled_disks = alloc.dupe(process.DiskMount, sampled_disks_buf[0..n_sampled_disks]) catch &.{};
+
         // Locate the current sticky mount in the list. If absent (e.g. unmounted),
         // fall back to the first available; if list empty, keep "/" hardcoded.
         const sticky_path = self.disk_mount_buf[0..self.disk_mount_len];
         var mount_idx: ?usize = null;
         var mi_k: usize = 0;
-        while (mi_k < n_mounts) : (mi_k += 1) {
-            if (std.mem.eql(u8, mounts[mi_k].path(), sticky_path)) {
+        while (mi_k < sampled_disks.len) : (mi_k += 1) {
+            if (std.mem.eql(u8, sampled_disks[mi_k].mount_path, sticky_path)) {
                 mount_idx = mi_k;
                 break;
             }
         }
-        if (mount_idx == null and n_mounts > 0) {
+        if (mount_idx == null and sampled_disks.len > 0) {
             mount_idx = 0;
-            const p = mounts[0].path();
+            const p = sampled_disks[0].mount_path;
             @memcpy(self.disk_mount_buf[0..p.len], p);
             self.disk_mount_len = @intCast(p.len);
         }
 
         const disk_cycles = self.disk_cycle_pending.swap(0, .seq_cst);
-        if (disk_cycles > 0 and n_mounts > 1) {
+        if (disk_cycles > 0 and sampled_disks.len > 1) {
             var mi2 = mount_idx orelse 0;
-            mi2 = (mi2 + (disk_cycles % n_mounts)) % n_mounts;
+            mi2 = (mi2 + (disk_cycles % sampled_disks.len)) % sampled_disks.len;
             mount_idx = mi2;
-            const p = mounts[mi2].path();
+            const p = sampled_disks[mi2].mount_path;
             @memcpy(self.disk_mount_buf[0..p.len], p);
             self.disk_mount_len = @intCast(p.len);
         }
 
-        // -------- statfs(<sticky mount>) for filesystem usage --------
-        // std.os.linux doesn't expose a statfs wrapper — call the syscall
-        // directly with our own struct layout (Linux x86_64/aarch64).
-        var fs_used: u64 = 0;
-        var fs_total: u64 = 0;
-        var fs_avail: u64 = 0;
-        var fs_type: []const u8 = "";
-        var path_z: [257]u8 = undefined;
-        const cur_path = self.disk_mount_buf[0..self.disk_mount_len];
-        @memcpy(path_z[0..cur_path.len], cur_path);
-        path_z[cur_path.len] = 0;
-        var sf: Statfs64 = undefined;
-        const sf_rc = std.os.linux.syscall2(.statfs, @intFromPtr(@as([*:0]const u8, @ptrCast(&path_z))), @intFromPtr(&sf));
-        if (std.os.linux.errno(sf_rc) == .SUCCESS) {
-            const bsize: u64 = @intCast(sf.bsize);
-            fs_total = sf.blocks * bsize;
-            fs_used = fsUsedBytes(sf.blocks, sf.bfree, bsize);
-            fs_avail = sf.bavail * bsize;
-            fs_type = fsTypeName(sf.type);
-        }
-        const fs_mount_owned: []const u8 = alloc.dupe(u8, cur_path) catch "/";
+        const active_disk: process.DiskMount = if (sampled_disks.len > 0)
+            sampled_disks[mount_idx orelse 0]
+        else
+            .{};
 
         var bat_pct: ?u8 = null;
         var bat_status: []const u8 = "";
@@ -1078,11 +1167,12 @@ pub const Linux = struct {
             .nproc = self.nproc,
             .disk_read_bps = disk_read_bps,
             .disk_write_bps = disk_write_bps,
-            .fs_root_used_bytes = fs_used,
-            .fs_root_total_bytes = fs_total,
-            .fs_root_avail_bytes = fs_avail,
-            .fs_mount_path = fs_mount_owned,
-            .fs_type_name = fs_type,
+            .disks = sampled_disks,
+            .fs_root_used_bytes = active_disk.used_bytes,
+            .fs_root_total_bytes = active_disk.total_bytes,
+            .fs_root_avail_bytes = active_disk.avail_bytes,
+            .fs_mount_path = active_disk.mount_path,
+            .fs_type_name = active_disk.fs_type_name,
             .net_iface_name = iface_name_owned,
             .net_rx_bps = net_rx_bps,
             .net_tx_bps = net_tx_bps,

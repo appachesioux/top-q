@@ -199,6 +199,14 @@ pub const ProcessTable = struct {
 // SystemSummary — header data
 // =============================================================================
 
+pub const DiskMount = struct {
+    mount_path: []const u8 = "/",
+    fs_type_name: []const u8 = "",
+    used_bytes: u64 = 0,
+    total_bytes: u64 = 0,
+    avail_bytes: u64 = 0,
+};
+
 pub const SystemSummary = struct {
     cpu_pct_total: f32 = 0,
     /// Per-core usage 0..100. Slice owned by the SystemSummary's allocator
@@ -217,6 +225,8 @@ pub const SystemSummary = struct {
     // ----- US5: disk + filesystem -----
     disk_read_bps: u64 = 0,
     disk_write_bps: u64 = 0,
+    /// All sampled filesystem mounts. Arena-owned.
+    disks: []const DiskMount = &.{},
     fs_root_used_bytes: u64 = 0,
     fs_root_total_bytes: u64 = 0,
     /// Space available to unprivileged users (statfs bavail) — matches df's Avail.

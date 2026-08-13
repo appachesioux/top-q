@@ -288,6 +288,8 @@ const LabelledRow = struct {
     pct: f32,
     /// Absolute figure shown between label and bar, e.g. "12G/31G". Empty → skip.
     abs: []const u8 = "",
+    /// Invert color scale (green when high, red when low) for availability metrics.
+    invert_color: bool = false,
 };
 
 /// Render rows of "<label> NN% [abs] [bar]" starting at inner row 0.
@@ -332,7 +334,7 @@ fn drawLabelledBars(
             });
         }
         if (bar_w >= 3) {
-            _ = drawBar(box, bar_col, @intCast(i), bar_w, r.pct);
+            _ = drawBar(box, bar_col, @intCast(i), bar_w, r.pct, r.invert_color);
         }
     }
 }
@@ -365,7 +367,7 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
     const rows = [_]LabelledRow{
         .{ .label = "Used:", .pct = used_pct, .abs = absUsedTotal(alloc, s.mem_used_bytes, s.mem_total_bytes) },
         .{ .label = "Cache:", .pct = cache_pct, .abs = absUsedTotal(alloc, s.mem_cache_bytes, s.mem_total_bytes) },
-        .{ .label = "Avail:", .pct = avail_pct, .abs = absUsedTotal(alloc, s.mem_available_bytes, s.mem_total_bytes) },
+        .{ .label = "Avail:", .pct = avail_pct, .abs = absUsedTotal(alloc, s.mem_available_bytes, s.mem_total_bytes), .invert_color = true },
         .{ .label = "Swap:", .pct = swap_pct, .abs = absUsedTotal(alloc, s.swap_used_bytes, s.swap_total_bytes) },
     };
     drawLabelledBars(alloc, box, &rows);
@@ -398,30 +400,96 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
 
 fn drawDiskBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h: u16, s: *const process.SystemSummary, sys_history: *const sample_mod.SystemHistory) void {
     const box = borderedBox(win, x, y, w, h);
+    if (box.height < 1) return;
+
     const disk_title = if (s.fs_type_name.len > 0)
         std.fmt.allocPrint(alloc, " disk · {s} ", .{s.fs_type_name}) catch " disk "
     else
         " disk ";
     drawBorderTitle(win, x, y, disk_title);
-    if (box.height < 1) return;
 
-    const root_pct = pctOf(s.fs_root_used_bytes, s.fs_root_total_bytes);
-    const avail_pct = pctOf(s.fs_root_avail_bytes, s.fs_root_total_bytes);
-    // Truncate long paths so they fit the 6-col label budget; keep root visible.
-    const label = if (s.fs_mount_path.len <= 6) s.fs_mount_path else s.fs_mount_path[s.fs_mount_path.len - 6 ..];
-    const rows = [_]LabelledRow{
-        .{
-            .label = label,
-            .pct = root_pct,
-            .abs = absUsedTotal(alloc, s.fs_root_used_bytes, s.fs_root_total_bytes),
-        },
-        .{
-            .label = "Avail:",
-            .pct = avail_pct,
-            .abs = absUsedTotal(alloc, s.fs_root_avail_bytes, s.fs_root_total_bytes),
-        },
-    };
-    drawLabelledBars(alloc, box, &rows);
+    const has_sparkline = (box.height >= 3 and box.width >= 4);
+    const has_throughput = (box.height >= 3);
+    const sparkline_row: ?u16 = if (has_sparkline) box.height - 1 else null;
+    const throughput_row: ?u16 = if (has_throughput) (if (has_sparkline and box.height >= 3) box.height - 2 else box.height - 1) else null;
+    const bar_budget: u16 = if (throughput_row) |tr| tr else box.height;
+
+    var rows_list = std.ArrayList(LabelledRow).initCapacity(alloc, 16) catch return;
+
+    const disks = if (s.disks.len > 0) s.disks else if (s.fs_root_total_bytes > 0) &[_]process.DiskMount{.{
+        .mount_path = s.fs_mount_path,
+        .fs_type_name = s.fs_type_name,
+        .used_bytes = s.fs_root_used_bytes,
+        .total_bytes = s.fs_root_total_bytes,
+        .avail_bytes = s.fs_root_avail_bytes,
+    }} else &.{};
+
+    if (disks.len > 0 and bar_budget > 0) {
+        var start_idx: usize = 0;
+        for (disks, 0..) |d, i| {
+            if (std.mem.eql(u8, d.mount_path, s.fs_mount_path)) {
+                start_idx = i;
+                break;
+            }
+        }
+
+        if (bar_budget >= disks.len * 2) {
+            // Mode 1: All disks fit with 2 rows (Used + Avail)
+            for (disks) |d| {
+                const root_pct = pctOf(d.used_bytes, d.total_bytes);
+                const avail_pct = pctOf(d.avail_bytes, d.total_bytes);
+                const label = if (d.mount_path.len <= 6) d.mount_path else d.mount_path[d.mount_path.len - 6 ..];
+                rows_list.append(alloc, .{
+                    .label = label,
+                    .pct = root_pct,
+                    .abs = absUsedTotal(alloc, d.used_bytes, d.total_bytes),
+                }) catch break;
+                rows_list.append(alloc, .{
+                    .label = "Avail:",
+                    .pct = avail_pct,
+                    .abs = absUsedTotal(alloc, d.avail_bytes, d.total_bytes),
+                    .invert_color = true,
+                }) catch break;
+            }
+        } else if (bar_budget >= disks.len) {
+            // Mode 2: All disks fit with 1 row each (Used), plus Avail row for the first N disks that fit
+            const extra_avail_rows = bar_budget - disks.len;
+            for (disks, 0..) |d, i| {
+                const root_pct = pctOf(d.used_bytes, d.total_bytes);
+                const label = if (d.mount_path.len <= 6) d.mount_path else d.mount_path[d.mount_path.len - 6 ..];
+                rows_list.append(alloc, .{
+                    .label = label,
+                    .pct = root_pct,
+                    .abs = absUsedTotal(alloc, d.used_bytes, d.total_bytes),
+                }) catch break;
+                if (i < extra_avail_rows) {
+                    const avail_pct = pctOf(d.avail_bytes, d.total_bytes);
+                    rows_list.append(alloc, .{
+                        .label = "Avail:",
+                        .pct = avail_pct,
+                        .abs = absUsedTotal(alloc, d.avail_bytes, d.total_bytes),
+                        .invert_color = true,
+                    }) catch break;
+                }
+            }
+        } else {
+            // Mode 3: Not all disks fit, show as many disks as fit starting from start_idx
+            var count: usize = 0;
+            while (count < disks.len and rows_list.items.len < bar_budget) : (count += 1) {
+                const d_idx = (start_idx + count) % disks.len;
+                const d = disks[d_idx];
+                const root_pct = pctOf(d.used_bytes, d.total_bytes);
+                const label = if (d.mount_path.len <= 6) d.mount_path else d.mount_path[d.mount_path.len - 6 ..];
+                rows_list.append(alloc, .{
+                    .label = label,
+                    .pct = root_pct,
+                    .abs = absUsedTotal(alloc, d.used_bytes, d.total_bytes),
+                }) catch break;
+            }
+        }
+
+        drawLabelledBars(alloc, box, rows_list.items);
+    }
 
     // Throughput lines below the bars.
     var rb: [16]u8 = undefined;
@@ -429,16 +497,16 @@ fn drawDiskBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, 
     const rd = utils.formatBytes(s.disk_read_bps, &rb);
     const wr = utils.formatBytes(s.disk_write_bps, &wb);
 
-    if (box.height >= 3) {
+    if (throughput_row) |tr| {
         const t = std.fmt.allocPrint(alloc, " rd {s}/s · wr {s}/s", .{ rd, wr }) catch return;
         _ = box.printSegment(.{ .text = t, .style = style.default_style }, .{
-            .row_offset = 2,
+            .row_offset = tr,
             .col_offset = 0,
         });
     }
 
-    if (box.height >= 3 and box.width >= 4) {
-        renderSparklineU64(alloc, box, 1, box.height - 1, box.width - 2, &sys_history.disk_bps, style.title_style);
+    if (sparkline_row) |sr| {
+        renderSparklineU64(alloc, box, 1, sr, box.width - 2, &sys_history.disk_bps, style.title_style);
     }
 }
 
@@ -583,7 +651,7 @@ fn drawCpuCores(
 
         // Bar: width includes the [ ] brackets.
         const bar_w_total: u16 = bar_interior_w + 2;
-        _ = drawBar(box, x + 4, y, bar_w_total, core_pct);
+        _ = drawBar(box, x + 4, y, bar_w_total, core_pct, false);
 
         // "NNN%"
         const pct_text = std.fmt.allocPrint(alloc, "{d:>3.0}%", .{core_pct}) catch continue;
@@ -846,7 +914,7 @@ fn drawCpuBlock(
 
 /// Draw a coloured progress bar of width `bar_w` at (col, row).
 /// Returns the column right after the bar's closing bracket.
-fn drawBar(win: Window, col: u16, row: u16, bar_w: u16, pct: f32) u16 {
+fn drawBar(win: Window, col: u16, row: u16, bar_w: u16, pct: f32, invert_color: bool) u16 {
     if (bar_w < 3) return col;
     win.writeCell(col, row, .{ .char = .{ .grapheme = "[", .width = 1 }, .style = style.dim_style });
     const inner_w: u16 = bar_w - 2;
@@ -858,12 +926,13 @@ fn drawBar(win: Window, col: u16, row: u16, bar_w: u16, pct: f32) u16 {
     // small percentages don't look like "empty".
     if (filled == 0 and clamped_pct > 0) filled = 1;
     if (filled > inner_w) filled = inner_w;
+    const bar_style = if (invert_color) style.gradientInverseStyle(pct) else style.gradientStyle(pct);
     var i: u16 = 0;
     while (i < inner_w) : (i += 1) {
         if (i < filled) {
             win.writeCell(col + 1 + i, row, .{
                 .char = .{ .grapheme = BAR_FILLED, .width = 1 },
-                .style = style.gradientStyle(pct),
+                .style = bar_style,
             });
         } else {
             win.writeCell(col + 1 + i, row, .{

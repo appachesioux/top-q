@@ -1,3 +1,4 @@
+const std = @import("std");
 const vaxis = @import("vaxis");
 
 pub const Style = vaxis.Style;
@@ -157,6 +158,19 @@ pub fn gradientStyle(pct: f32) Style {
     return .{ .fg = gradientFg(pct), .bold = pct >= 85.0 };
 }
 
+/// Inverse gradient for available/free metrics ("Avail").
+/// High available percent (> 40%) is healthy (green), moderate (15..40%) is
+/// warning (yellow), and low (<= 15%) is critical (red bold).
+pub fn gradientInverseFg(pct: f32) Color {
+    if (pct <= 15.0) return .{ .rgb = grad_high_rgb };
+    if (pct <= 40.0) return .{ .rgb = grad_mid_rgb };
+    return .{ .rgb = grad_low_rgb };
+}
+
+pub fn gradientInverseStyle(pct: f32) Style {
+    return .{ .fg = gradientInverseFg(pct), .bold = pct <= 15.0 };
+}
+
 // =============================================================================
 // Column layout — fixed widths; comm takes the remainder
 // =============================================================================
@@ -167,3 +181,42 @@ pub const STATE_W: usize = 2;
 pub const CPU_W: usize = 6;
 pub const MEM_W: usize = 6;
 // COMM_W = remaining columns
+
+test "gradient style thresholds" {
+    const low = gradientStyle(50.0);
+    try std.testing.expectEqual(grad_low_rgb, low.fg.rgb);
+    try std.testing.expect(!low.bold);
+
+    const mid = gradientStyle(70.0);
+    try std.testing.expectEqual(grad_mid_rgb, mid.fg.rgb);
+    try std.testing.expect(!mid.bold);
+
+    const high = gradientStyle(90.0);
+    try std.testing.expectEqual(grad_high_rgb, high.fg.rgb);
+    try std.testing.expect(high.bold);
+}
+
+test "inverse gradient style thresholds for available metrics" {
+    // High available (> 40%) -> Green, not bold
+    const high_avail = gradientInverseStyle(90.0);
+    try std.testing.expectEqual(grad_low_rgb, high_avail.fg.rgb);
+    try std.testing.expect(!high_avail.bold);
+
+    const mid_high_avail = gradientInverseStyle(45.0);
+    try std.testing.expectEqual(grad_low_rgb, mid_high_avail.fg.rgb);
+    try std.testing.expect(!mid_high_avail.bold);
+
+    // Medium available (15%..40%) -> Yellow, not bold
+    const mid_avail = gradientInverseStyle(30.0);
+    try std.testing.expectEqual(grad_mid_rgb, mid_avail.fg.rgb);
+    try std.testing.expect(!mid_avail.bold);
+
+    // Low available (<= 15%) -> Red, bold
+    const low_avail = gradientInverseStyle(10.0);
+    try std.testing.expectEqual(grad_high_rgb, low_avail.fg.rgb);
+    try std.testing.expect(low_avail.bold);
+
+    const zero_avail = gradientInverseStyle(0.0);
+    try std.testing.expectEqual(grad_high_rgb, zero_avail.fg.rgb);
+    try std.testing.expect(zero_avail.bold);
+}
