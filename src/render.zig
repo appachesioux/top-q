@@ -709,7 +709,11 @@ fn drawSysBlock(
     s: *const process.SystemSummary,
 ) void {
     const box = borderedBox(win, x, y, w, h);
-    drawBorderTitle(win, x, y, " sys ");
+    const sys_title = if (s.hostname.len > 0)
+        std.fmt.allocPrint(alloc, " sys · {s} ", .{s.hostname}) catch " sys "
+    else
+        " sys ";
+    drawBorderTitle(win, x, y, sys_title);
     const inner_h = box.height;
     if (inner_h < 1) return;
 

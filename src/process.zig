@@ -245,6 +245,7 @@ pub const SystemSummary = struct {
     net_ip: []const u8 = "",
 
     // ----- System Information (conf.png / fastfetch) -----
+    hostname: []const u8 = "",
     os_name: []const u8 = "",
     kernel_release: []const u8 = "",
     host_model: []const u8 = "",

@@ -298,3 +298,11 @@ test "enumerateMounts filters pseudo, overlay, EFI, and deduplicates Btrfs subvo
     try std.testing.expectEqualStrings("/tpol", entries[1].path());
     try std.testing.expectEqualStrings("/var/tmp", entries[2].path());
 }
+
+test "parseHostname returns a non-empty string on Linux" {
+    top_q.ctx.io = std.testing.io;
+    const a = std.testing.allocator;
+    const h = linux.parseHostname(a);
+    defer a.free(h);
+    try std.testing.expect(h.len > 0);
+}

@@ -626,6 +626,7 @@ pub const Linux = struct {
         os_name: []const u8,
         kernel_release: []const u8,
         host_model: []const u8,
+        hostname: []const u8,
         cpu_model: []const u8,
         gpus: []const []const u8,
 
@@ -634,6 +635,7 @@ pub const Linux = struct {
                 .os_name = parseOsName(alloc),
                 .kernel_release = parseKernelRelease(alloc),
                 .host_model = parseHostModel(alloc),
+                .hostname = parseHostname(alloc),
                 .cpu_model = parseCpuModel(alloc),
                 .gpus = detectGpus(alloc),
             };
@@ -643,6 +645,7 @@ pub const Linux = struct {
             alloc.free(self.os_name);
             alloc.free(self.kernel_release);
             alloc.free(self.host_model);
+            alloc.free(self.hostname);
             alloc.free(self.cpu_model);
             for (self.gpus) |gpu| alloc.free(gpu);
             if (self.gpus.len > 0) alloc.free(self.gpus);
@@ -1177,6 +1180,7 @@ pub const Linux = struct {
             .net_rx_bps = net_rx_bps,
             .net_tx_bps = net_tx_bps,
             .net_ip = self.net_ip,
+            .hostname = self.static_info.hostname,
             .os_name = self.static_info.os_name,
             .kernel_release = self.static_info.kernel_release,
             .host_model = self.static_info.host_model,
@@ -1479,15 +1483,24 @@ fn parseHostModel(alloc: std.mem.Allocator) []const u8 {
     var buf: [256]u8 = undefined;
     const n = readSmallFile("/sys/class/dmi/id/product_name", &buf) catch {
         const n2 = readSmallFile("/sys/devices/virtual/dmi/id/product_name", &buf) catch {
-            const n3 = readSmallFile("/proc/sys/kernel/hostname", &buf) catch return alloc.dupe(u8, "Desktop") catch &.{};
-            const trimmed = std.mem.trim(u8, buf[0..n3], " \t\r\n");
-            return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "Desktop") catch &.{};
+            return alloc.dupe(u8, "Desktop") catch &.{};
         };
         const trimmed = std.mem.trim(u8, buf[0..n2], " \t\r\n");
         return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "Desktop") catch &.{};
     };
     const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
     return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "Desktop") catch &.{};
+}
+
+pub fn parseHostname(alloc: std.mem.Allocator) []const u8 {
+    var buf: [256]u8 = undefined;
+    const n = readSmallFile("/proc/sys/kernel/hostname", &buf) catch {
+        const n2 = readSmallFile("/etc/hostname", &buf) catch return alloc.dupe(u8, "") catch &.{};
+        const trimmed = std.mem.trim(u8, buf[0..n2], " \t\r\n");
+        return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "") catch &.{};
+    };
+    const trimmed = std.mem.trim(u8, buf[0..n], " \t\r\n");
+    return alloc.dupe(u8, trimmed) catch alloc.dupe(u8, "") catch &.{};
 }
 
 fn parseCpuModel(alloc: std.mem.Allocator) []const u8 {
