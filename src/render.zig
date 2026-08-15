@@ -365,10 +365,10 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
     const swap_pct = pctOf(s.swap_used_bytes, s.swap_total_bytes);
 
     const rows = [_]LabelledRow{
-        .{ .label = "Used:", .pct = used_pct, .abs = absUsedTotal(alloc, s.mem_used_bytes, s.mem_total_bytes) },
-        .{ .label = "Cache:", .pct = cache_pct, .abs = absUsedTotal(alloc, s.mem_cache_bytes, s.mem_total_bytes) },
+        .{ .label = " Used:", .pct = used_pct, .abs = absUsedTotal(alloc, s.mem_used_bytes, s.mem_total_bytes) },
         .{ .label = "Avail:", .pct = avail_pct, .abs = absUsedTotal(alloc, s.mem_available_bytes, s.mem_total_bytes), .invert_color = true },
-        .{ .label = "Swap:", .pct = swap_pct, .abs = absUsedTotal(alloc, s.swap_used_bytes, s.swap_total_bytes) },
+        .{ .label = "Cache:", .pct = cache_pct, .abs = absUsedTotal(alloc, s.mem_cache_bytes, s.mem_total_bytes) },
+        .{ .label = " Swap:", .pct = swap_pct, .abs = absUsedTotal(alloc, s.swap_used_bytes, s.swap_total_bytes) },
     };
     drawLabelledBars(alloc, box, &rows);
 
