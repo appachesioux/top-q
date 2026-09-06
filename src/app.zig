@@ -14,6 +14,27 @@ const utils = @import("utils.zig");
 const Vaxis = vaxis.Vaxis;
 const Tty = vaxis.Tty;
 
+/// COLORFGBG heuristic (xterm/konsole set it): the bg index is the last
+/// semicolon-separated number; 7 and 9..15 are light backgrounds.
+fn schemeFromColorFgBg(cfg: []const u8) ?vaxis.Color.Scheme {
+    const trimmed = std.mem.trim(u8, cfg, " \t\r\n");
+    const last_semi = std.mem.lastIndexOfScalar(u8, trimmed, ';') orelse return null;
+    const bg = std.fmt.parseInt(u8, trimmed[last_semi + 1 ..], 10) catch return null;
+    return switch (bg) {
+        0...6, 8 => .dark,
+        7, 9...15 => .light,
+        else => null,
+    };
+}
+
+test "COLORFGBG heuristic" {
+    try std.testing.expectEqual(vaxis.Color.Scheme.dark, schemeFromColorFgBg("15;0"));
+    try std.testing.expectEqual(vaxis.Color.Scheme.light, schemeFromColorFgBg("0;15"));
+    try std.testing.expectEqual(vaxis.Color.Scheme.light, schemeFromColorFgBg("8;7"));
+    try std.testing.expect(schemeFromColorFgBg("default;default") == null);
+    try std.testing.expect(schemeFromColorFgBg("") == null);
+}
+
 // =============================================================================
 // Event union — what the main thread receives via vaxis.Loop
 // =============================================================================
@@ -39,6 +60,8 @@ pub const Event = union(enum) {
     refresh: RefreshPayload,
     sample: SamplePayload,
     detail: DetailPayload,
+    color_scheme: vaxis.Color.Scheme,
+    color_report: vaxis.Color.Report,
 };
 
 const Loop = vaxis.Loop(Event);
@@ -194,12 +217,17 @@ const Collector = struct {
 // App — main thread state and event loop
 // =============================================================================
 
+/// Theme selection: `auto` follows the terminal's reported color scheme
+/// (OSC 996 / DEC mode 2031); `dark`/`light` pin a palette explicitly.
+pub const ThemeMode = enum { auto, dark, light };
+
 pub const Options = struct {
     delay_ms: u64 = 1500,
     no_color: bool = false,
     profile: bool = false,
     no_sync_output: bool = false,
     initial_user_filter: ?[]const u8 = null,
+    theme: ThemeMode = .auto,
 };
 
 pub const App = struct {
@@ -230,6 +258,13 @@ pub const App = struct {
 
     state: view_mod.ViewState,
     options: Options,
+    /// How the palette was chosen: terminal report (auto) or explicit pin.
+    theme_mode: ThemeMode = .auto,
+    /// Palette currently applied; kept so `t` can flip to the opposite one.
+    scheme: vaxis.Color.Scheme = .dark,
+    /// Whether an OSC 11 background luminance report arrived; represents the
+    /// ground truth of the terminal surface against which text must contrast.
+    have_bg_report: bool = false,
     should_quit: bool,
     last_apply_us: u64,
     last_draw_us: u64,
@@ -304,6 +339,28 @@ pub const App = struct {
         self.vx.caps.unicode = .unicode;
         try self.vx.enterAltScreen(self.tty.writer());
 
+        // Ask the terminal for its color scheme (dark/light) and subscribe to
+        // live changes. Terminals without OSC 996 / mode 2031 support never
+        // reply and we simply keep the default dark palette. An explicit
+        // --theme/--light pins the palette and ignores terminal reports.
+        self.vx.subscribeToColorSchemeUpdates(self.tty.writer()) catch {};
+        self.theme_mode = opts.theme;
+        if (opts.theme != .auto) {
+            self.scheme = if (opts.theme == .light) .light else .dark;
+            style.setScheme(self.scheme);
+        } else {
+            // Terminal background detection: COLORFGBG seeds the initial palette
+            // for older terminals, OSC 996 / mode 2031 gives an initial hint, and
+            // OSC 11 background query provides the authoritative ground truth.
+            if (ctx.env_map.get("COLORFGBG")) |cfg| {
+                if (schemeFromColorFgBg(cfg)) |scheme| {
+                    self.scheme = scheme;
+                    style.setScheme(scheme);
+                }
+            }
+            self.vx.queryColor(self.tty.writer(), .bg) catch {};
+        }
+
         // Pre-apply user filter if requested via CLI
         if (opts.initial_user_filter) |name| {
             self.state.filter.field = .user;
@@ -339,7 +396,7 @@ pub const App = struct {
                     var d = payload.detail;
                     d.deinit();
                 },
-                .sample, .key_press, .winsize => {},
+                .sample, .key_press, .winsize, .color_scheme, .color_report => {},
             }
         }
 
@@ -392,6 +449,27 @@ pub const App = struct {
             .sample => |payload| self.acceptSample(payload),
             .detail => |payload| self.acceptDetail(payload),
             .key_press => |key| try self.handleKey(key),
+            .color_scheme => |scheme| if (self.theme_mode == .auto) {
+                // If we do not yet have a direct OSC 11 background report, adopt
+                // the terminal's reported color scheme as fallback.
+                if (!self.have_bg_report) {
+                    self.scheme = scheme;
+                    style.setScheme(scheme);
+                }
+                // When mode 2031 reports a scheme change, query OSC 11 to confirm
+                // the terminal's actual surface background luminance.
+                self.vx.queryColor(self.tty.writer(), .bg) catch {};
+            },
+            .color_report => |report| {
+                if (self.theme_mode == .auto and report.kind == .bg) {
+                    self.have_bg_report = true;
+                    const c = report.value;
+                    const lum = (299 * @as(u32, c[0]) + 587 * @as(u32, c[1]) + 114 * @as(u32, c[2])) / 1000;
+                    const scheme: vaxis.Color.Scheme = if (lum > 127) .light else .dark;
+                    self.scheme = scheme;
+                    style.setScheme(scheme);
+                }
+            },
         }
     }
 
@@ -652,6 +730,18 @@ pub const App = struct {
             self.state.prev_mode = self.state.mode;
             self.state.help_scroll = 0;
             self.state.mode = .help;
+            return;
+        }
+
+        // 't' flips light/dark and pins the choice (terminal reports are
+        // ignored afterwards). Input modes are excluded: 't' is text there.
+        if (key.matches('t', .{}) and
+            self.state.mode != .filter_input and
+            self.state.mode != .search_input)
+        {
+            self.scheme = if (self.scheme == .light) .dark else .light;
+            self.theme_mode = if (self.scheme == .light) .light else .dark;
+            style.setScheme(self.scheme);
             return;
         }
 

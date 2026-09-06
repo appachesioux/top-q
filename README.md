@@ -12,7 +12,7 @@ zig build run -- -d 500        # 500 ms refresh
 zig build run -- -u $USER      # pre-filter by user
 ```
 
-Navigate with `j`/`k` (or arrows), `g`/`G`, `PgUp`/`PgDn`. Sort with `s` (cycle) and `r` (reverse). Filter with `/`, clear with `\`. Send a signal with `K` (confirmation required). Help with `?` or `F1`. Quit with `q`.
+Navigate with `j`/`k` (or arrows), `g`/`G`, `PgUp`/`PgDn`. Sort with `s` (cycle) and `r` (reverse). Filter with `/`, clear with `\`. Send a signal with `K` (confirmation required). Press `t` to flip the light/dark theme. Help with `?` or `F1`. Quit with `q`.
 
 The process list receives most of the available vertical space. On high-core-count systems, the CPU panel expands or switches to a compact grid so every logical CPU remains visible.
 
@@ -45,6 +45,10 @@ top-q [options]
   -V, --version        Show version and exit
   -d, --delay <ms>     Refresh interval in ms (200..10000, default 1500)
   -u, --user <name>    Pre-apply user filter at startup
+      --theme <mode>   Color theme: auto|dark|light (default auto;
+                     auto follows the terminal's reported scheme)
+      --light          Same as --theme light
+                     (also pinnable via TOPQ_THEME env)
       --no-color       Disable colours (also via NO_COLOR env)
       --profile        Show live collection/render timings
       --no-sync        Disable terminal synchronized-output protocol

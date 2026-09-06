@@ -619,8 +619,8 @@ fn drawCpuCores(
     const ncores: u16 = @intCast(per_cpu.len);
     if (ncores == 0 or avail_rows == 0 or box.width == 0) return;
 
-    // Per-core cell overhead: " cNN [" + bar_interior + "] NNN%" + 1 separator
-    // Label 3, leading/brackets/spaces 5, pct 4, trailing separator 1 → 13 fixed.
+    // Per-core cell layout: " cNN NNN% [" + bar_interior + "]" + 1 separator.
+    // Its fixed width is unchanged when moving the percentage before the bar.
     const min_cell_w: u16 = 13;
 
     const layout = computeCpuLayout(ncores, avail_rows, box.width, min_cell_w);
@@ -649,16 +649,16 @@ fn drawCpuCores(
             .col_offset = x,
         });
 
-        // Bar: width includes the [ ] brackets.
-        const bar_w_total: u16 = bar_interior_w + 2;
-        _ = drawBar(box, x + 4, y, bar_w_total, core_pct, false);
-
         // "NNN%"
         const pct_text = std.fmt.allocPrint(alloc, "{d:>3.0}%", .{core_pct}) catch continue;
         _ = box.printSegment(.{ .text = pct_text, .style = style.gradientStyle(core_pct) }, .{
             .row_offset = y,
-            .col_offset = x + 4 + bar_w_total + 1,
+            .col_offset = x + 4,
         });
+
+        // Bar: width includes the [ ] brackets.
+        const bar_w_total: u16 = bar_interior_w + 2;
+        _ = drawBar(box, x + 9, y, bar_w_total, core_pct, false);
     }
 }
 
@@ -1198,6 +1198,7 @@ fn drawStatusBar(
         .{ .key = "/", .action = " filter" },
         .{ .key = "F3", .action = " search" },
         .{ .key = "K", .action = " kill" },
+        .{ .key = "t", .action = " theme" },
         .{ .key = "F1", .action = " help" },
         .{ .key = "q", .action = " quit" },
     };
@@ -1358,6 +1359,7 @@ const help_right = [_][]const u8{
     "  HUP INT QUIT KILL USR1 USR2 TERM",
     "",
     "GENERAL",
+    "  t            Theme light/dark",
     "  F1           This help",
 };
 

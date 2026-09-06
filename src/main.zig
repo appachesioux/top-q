@@ -15,6 +15,10 @@ const help_text =
     \\  -V, --version        Show version and exit
     \\  -d, --delay <ms>     Refresh interval in ms (200..10000, default 1500)
     \\  -u, --user <name>    Pre-apply user filter at startup
+    \\      --theme <mode>   Color theme: auto|dark|light (default auto;
+    \\                     auto follows the terminal's reported scheme)
+    \\      --light          Same as --theme light
+    \\                     (also pinnable via TOPQ_THEME env)
     \\      --no-color       Disable colours (also via NO_COLOR env)
     \\      --profile        Show live collection/render timings
     \\      --no-sync        Disable terminal synchronized-output protocol
@@ -66,6 +70,23 @@ fn parseArgs(alloc: std.mem.Allocator, init: std.process.Init) !AppOptions {
             };
             // Dup the value so it outlives the args iterator.
             opts.initial_user_filter = try alloc.dupe(u8, next);
+        } else if (std.mem.eql(u8, arg, "--theme")) {
+            const next = args.next() orelse {
+                writeStderr("top-q: --theme requires a value (auto|dark|light)\n");
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, next, "auto")) {
+                opts.theme = .auto;
+            } else if (std.mem.eql(u8, next, "dark")) {
+                opts.theme = .dark;
+            } else if (std.mem.eql(u8, next, "light")) {
+                opts.theme = .light;
+            } else {
+                writeStderr("top-q: --theme must be auto, dark or light\n");
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--light")) {
+            opts.theme = .light;
         } else if (std.mem.eql(u8, arg, "--no-color")) {
             opts.no_color = true;
         } else if (std.mem.eql(u8, arg, "--profile")) {
@@ -92,6 +113,13 @@ pub fn main(init: std.process.Init) !void {
 
     var opts = try parseArgs(alloc, init);
     if (init.minimal.environ.getPosix("NO_COLOR")) |_| opts.no_color = true;
+    // TOPQ_THEME pins the palette like the CLI flag (CLI still wins).
+    if (opts.theme == .auto) {
+        if (ctx.env_map.get("TOPQ_THEME")) |v| {
+            if (std.mem.eql(u8, v, "light")) opts.theme = .light;
+            if (std.mem.eql(u8, v, "dark")) opts.theme = .dark;
+        }
+    }
     defer if (opts.initial_user_filter) |s| alloc.free(s);
 
     const app = App.init(alloc, opts) catch |e| {

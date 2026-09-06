@@ -11,7 +11,7 @@ config:
   runtime:      terminal interativo (tty)
   config-file:  none (convention over configuration)
   refresh:      1000 ms (override via --delay)
-  theme:        assume terminal de fundo escuro; --no-color e NO_COLOR honrados; light pendente
+  theme:        dark/light com auto-deteccao pelo terminal (OSC 996 / mode 2031, live); --theme auto|dark|light e --light fixam; tecla t alterna; --no-color e NO_COLOR honrados
 
 stack:
   - zig 0.16.0
@@ -154,3 +154,7 @@ comportamentos:
 
 ref:
   inspiração:  htop (lista limpa, navegação), btop++ (riqueza de detalhe, sparklines)
+
++## Princípio KISS
+
+- Prefira a solução mais simples que atenda ao requisito atual; introduza abstrações, camadas, configurações ou dependências apenas diante de necessidade concreta.
