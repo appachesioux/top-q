@@ -2,16 +2,18 @@
 
 ## Segurança
 
-- Não modifique, administre ou opere recursos fora desta máquina. Isso inclui bancos, servidores, arquivos, repositórios remotos, serviços, configurações, deploys e infraestrutura.
-- Use a internet somente para consultar ou baixar conteúdo público. Não envie dados, faça `git push` nem chame APIs que alterem estado remoto.
+- Não modifique, administre ou opere recursos fora desta máquina. Isso inclui bancos, servidores, arquivos, repositórios remotos, serviços, configurações, deploys e infraestrutura. A única exceção é o `git push`, nas condições abaixo.
+- Use a internet somente para consultar ou baixar conteúdo público. Não envie dados nem chame APIs que alterem estado remoto.
+- Execute `git push` somente quando o usuário pedir explicitamente; o pedido vale para aquele push, não para os seguintes. Sem pedido, deixe os commits prontos e informe. `--force` e variantes só com pedido explícito também para isso.
 - Não exponha credenciais, tokens ou dados sensíveis em comandos, logs ou respostas.
+- Não inclua `Co-Authored-By: ...` no texto de commit, nem nenhum outro registro de autoria, atribuição ou rastreio de IA, ferramenta ou modelo (`Generated with ...`, `*-Session:`, links de sessão e afins) em commits, PRs, issues, comentários ou arquivos, mesmo que a ferramenta mande incluir. O hook global `~/.config/git/hooks/commit-msg` remove essas linhas dos commits.
 
 ## Autonomia
 
 - Leitura, busca, inspeção e diagnóstico local não destrutivo são livres. Testes e builds que geram somente caches ou temporários também são livres.
 - Antes de alterar algo, apresente os achados relevantes e diga objetivamente o que será feito.
 - Uma tarefa já autorizada não exige nova autorização para cada edição prevista. Discuta e aguarde aprovação quando houver mudança material de abordagem, arquitetura ou escopo.
-- Peça autorização explícita antes de operações destrutivas, difíceis de reverter, DDL, DML ou migrations em banco local.
+- O banco local é transitório e pode ser alterado livremente, inclusive com DDL, DML e migrations. Peça autorização explícita antes de outras operações destrutivas ou difíceis de reverter.
 
 ## Trabalho
 
@@ -19,6 +21,7 @@
 - Avalie criticamente as abordagens, inclusive as propostas pelo usuário, considerando simplicidade, risco e manutenção futura.
 - Quando um padrão melhor for adotado para uma tarefa recorrente, faça os projetos controlados pelo usuário convergirem para ele. Não preserve implementações obsoletas ou padrões paralelos apenas para evitar a migração; planeje a transição, limite o escopo e valide. Não atualize por moda ou sem benefício concreto.
 - Faça mudanças cirúrgicas. Não refatore, reformate, renomeie nem modifique código funcional fora do objetivo. Relate problemas adjacentes sem corrigi-los.
+- Em qualquer linguagem, prefira a forma de expressão simples, explícita e idiomática à forma mais obscura ou excessivamente concisa, quando ambas atendam ao requisito; priorize legibilidade e manutenção.
 - Preserve alterações existentes do usuário. No código compartilhado, preserve contratos e convenções do projeto; mudanças que afetem outros consumidores exigem discussão prévia.
 - Use primeiro os recursos existentes. Não instale skills, plugins, ferramentas ou dependências sem necessidade concreta e aprovação.
 - Diferencie fatos observados, inferências e dúvidas. Pergunte quando a incerteza puder mudar materialmente o resultado; em dúvidas pequenas, use uma suposição explícita e conservadora.
