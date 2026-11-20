@@ -304,10 +304,10 @@ pub const ProcessDetail = struct {
 };
 
 test "signal menu covers every declared signal" {
-    const fields = @typeInfo(Signal).@"enum".fields;
-    try std.testing.expectEqual(fields.len, Signal.menu.len);
-    inline for (fields) |f| {
-        const s: Signal = @enumFromInt(f.value);
+    const values = @typeInfo(Signal).@"enum".field_values;
+    try std.testing.expectEqual(values.len, Signal.menu.len);
+    inline for (values) |v| {
+        const s: Signal = @enumFromInt(v);
         var found = false;
         for (Signal.menu) |m| {
             if (m == s) found = true;

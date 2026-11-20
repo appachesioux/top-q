@@ -54,4 +54,4 @@ Aplicáveis aos projetos PostgreSQL controlados pelo proprietário. Decisões es
 - Projetos Go usam Goose; projetos Java usam Flyway.
 - Migration publicada ou anterior à alteração atual é imutável. Faça qualquer correção em uma nova migration.
 - Migration criada no trabalho atual, usada somente no processo local e não publicada pode ser editada ou consolidada, mesmo após aplicação em banco local transitório.
-- Nunca execute DDL, DML ou migration sem autorização explícita e nunca opere banco remoto.
+- DDL, DML e migrations são livres no banco local (transitório). Nunca opere banco remoto.

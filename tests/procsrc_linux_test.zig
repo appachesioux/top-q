@@ -306,3 +306,8 @@ test "parseHostname returns a non-empty string on Linux" {
     defer a.free(h);
     try std.testing.expect(h.len > 0);
 }
+
+test "parsePidStat: tty_nr is the 7th field" {
+    const ps = try linux.parsePidStat("123 (a b) S 1 123 123 34816 123 4194304 0 0 0 0 5 6 0 0 20 0 1 0 100 1000 10");
+    try std.testing.expectEqual(@as(i32, 34816), ps.tty_nr);
+}

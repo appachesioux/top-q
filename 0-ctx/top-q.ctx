@@ -1,7 +1,7 @@
 Project Context - ctx
 -----------------------------------
 app-name: top-q
-version: 26.8.15
+version: 26.11.20
 description: TUI de monitoramento de sistema — lista enxuta htop-like + detalhe btop-like via divulgação progressiva
 modulos-iniciais: lista de processos, detalhe sob demanda, painel de sistema, sort/filter, sinais
 plataformas: linux (v1), macos (v2 planejado)
@@ -14,7 +14,7 @@ config:
   theme:        dark/light com auto-deteccao pelo terminal (OSC 996 / mode 2031, live); --theme auto|dark|light e --light fixam; tecla t alterna; --no-color e NO_COLOR honrados
 
 stack:
-  - zig 0.16.0
+  - zig 0.17.1
   - libvaxis 0.6.0 (commit e090d3ba — mesma revisão de ~/Devel/xpl-f)
   - zero deps adicionais (sem libgtop, sem libc obrigatório)
 
@@ -72,6 +72,7 @@ rules:
   - lista ≥75% da altura total da tela
   - CPU% nunca conta iowait como busy; índices ≥8 de /proc/stat são ignorados (guest/guest_nice já em user/nice)
   - "Cached" segue fórmula btop++: Cached - Shmem (sem Buffers, sem SReclaimable)
+  - Disk Used%/Avail% seguem o df: base = used + avail (reserva do root fica fora; total só no texto)
   - toda métrica nova é validada contra ferramenta de referência (htop/btop/iostat/free/ifconfig) antes de fechar
   - parsers, cálculos de delta e packing de layout ganham teste antes do merge
   - leituras /proc não-críticas (ex: /proc/<pid>/io EACCES) degradam para "--"; nunca crasham
@@ -95,6 +96,7 @@ comportamentos:
     D              -> cicla mountpoint no bloco DISK (wrap)
     K              -> entra modo signal_confirm pro PID selecionado
     F1             -> overlay de ajuda
+    Ctrl-l         -> redesenho completo (vx.queueRefresh), em qualquer modo; limpa texto que outro processo escreveu no tty
     q/Ctrl-c       -> sai
   modo detail:
     Esc/Tab        -> volta pra lista
@@ -114,7 +116,7 @@ comportamentos:
     g/G/Home/End   -> topo/fim
     qualquer outro -> fecha (mantém o "press any key to close" de quem não rola)
     layout         -> duas colunas; MIN_W=80 garante que sempre cabem na largura,
-                      só a altura pode exigir scroll (h≥27 mostra tudo; h=24 rola 3 linhas)
+                      só a altura pode exigir scroll (h≥29 mostra tudo; h=24 rola 5 linhas)
   modo search_input:
     <chars>        -> busca incremental; salta a seleção pro próximo match, wrap
     Backspace      -> apaga 1 char

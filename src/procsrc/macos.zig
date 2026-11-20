@@ -28,6 +28,11 @@ pub const MacOS = struct {
         return error.NotImplemented;
     }
 
+    pub fn sharesTty(pid: process.Pid) bool {
+        _ = pid;
+        return false;
+    }
+
     pub fn signal(self: *MacOS, pid: process.Pid, sig: process.Signal) !void {
         _ = self;
         std.posix.kill(@intCast(pid), @enumFromInt(@intFromEnum(sig))) catch |e| switch (e) {

@@ -272,6 +272,8 @@ pub const App = struct {
     last_tty_bytes: u64,
     last_refresh_at_ns: i64,
     last_refresh_gap_us: u64,
+    /// Active after signalling a process on our tty; see RepaintWatch.
+    repaint_watch: ?view_mod.RepaintWatch = null,
 
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*App {
         const self = try alloc.create(App);
@@ -516,6 +518,13 @@ pub const App = struct {
             self.restoreSelectionAtViewportOffset(offset);
         }
         self.state.tickFlash();
+        if (self.repaint_watch) |*rw| {
+            if (rw.tick(self.table.lookup(rw.pid) != null)) {
+                self.vx.queueRefresh();
+            } else {
+                self.repaint_watch = null;
+            }
+        }
         self.last_apply_us = elapsedUs(apply_started, utils.nanoTimestamp());
     }
 
@@ -584,6 +593,7 @@ pub const App = struct {
             var buf: [128]u8 = undefined;
             const msg = std.fmt.bufPrint(&buf, "✓ sent SIG{s} to PID {d}", .{ sig.name(), pid }) catch "✓ signal sent";
             self.state.setFlash(msg);
+            if (procsrc.sharesTty(pid)) self.repaint_watch = .{ .pid = pid };
             self.state.mode = self.state.prev_mode;
             return;
         }
@@ -718,6 +728,14 @@ pub const App = struct {
         // "press any key to close" key.
         if (key.matches('c', .{ .ctrl = true })) {
             self.should_quit = true;
+            return;
+        }
+
+        // Ctrl+L repaints every cell, wiping text other processes wrote to
+        // the same tty (e.g. a background job logging after a kill). Diff
+        // rendering alone never touches cells whose content did not change.
+        if (key.matches('l', .{ .ctrl = true })) {
+            self.vx.queueRefresh();
             return;
         }
 

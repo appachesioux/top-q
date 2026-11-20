@@ -1,11 +1,11 @@
 .{
     .fingerprint = 0xe7e53e266d9da678,
     .name = .top_q,
-    .version = "26.9.6",
+    .version = "26.11.20",
     .dependencies = .{
         .vaxis = .{
-            .url = "git+https://github.com/rockorager/libvaxis.git#e090d3baecd4b136a3ab95532e4219a3ece81616",
-            .hash = "vaxis-0.6.0-BWNV_EDwCQCjOpS8iRYzYxjh2tTeiOU0KJ8LaWbfYZvG",
+            .url = "git+https://github.com/rockorager/libvaxis.git#25b4bd7371cc3c32049e103ab292a525a1ecb7a7",
+            .hash = "vaxis-0.6.0-BWNV_G8gDgCNWI48cFKWal2NROjTRQXumw3ssMDeD6jt",
         },
     },
     .paths = .{

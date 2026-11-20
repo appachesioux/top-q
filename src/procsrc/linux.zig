@@ -26,6 +26,7 @@ pub const PidStat = struct {
     comm: []const u8, // borrows from input buffer (between parens)
     state: ProcessState,
     ppid: Pid,
+    tty_nr: i32, // controlling terminal device; 0 = none
     utime: u64, // jiffies user mode
     stime: u64, // jiffies kernel mode
     num_threads: u32,
@@ -56,6 +57,7 @@ pub fn parsePidStat(buf: []const u8) !PidStat {
 
     var state: ProcessState = .unknown;
     var ppid: Pid = 0;
+    var tty_nr: i32 = 0;
     var utime: u64 = 0;
     var stime: u64 = 0;
     var num_threads: u32 = 0;
@@ -67,6 +69,7 @@ pub fn parsePidStat(buf: []const u8) !PidStat {
         switch (idx) {
             0 => state = ProcessState.fromChar(if (tok.len > 0) tok[0] else '?'),
             1 => ppid = std.fmt.parseInt(Pid, tok, 10) catch 0,
+            4 => tty_nr = std.fmt.parseInt(i32, tok, 10) catch 0,
             11 => utime = std.fmt.parseInt(u64, tok, 10) catch 0, // utime  (field 14 overall - we already consumed pid, comm, state, ppid → idx after state=0; so utime is at index 11 from rest start because: 0=state,1=ppid,2=pgrp,3=session,4=tty_nr,5=tpgid,6=flags,7=minflt,8=cminflt,9=majflt,10=cmajflt,11=utime,12=stime)
             12 => stime = std.fmt.parseInt(u64, tok, 10) catch 0,
             17 => num_threads = std.fmt.parseInt(u32, tok, 10) catch 0,
@@ -83,6 +86,7 @@ pub fn parsePidStat(buf: []const u8) !PidStat {
         .comm = comm,
         .state = state,
         .ppid = ppid,
+        .tty_nr = tty_nr,
         .utime = utime,
         .stime = stime,
         .num_threads = num_threads,
@@ -294,10 +298,9 @@ pub fn enumerateMounts(buf: []const u8, out: []MountEntry) u8 {
         }
         if (skip) continue;
 
-        // Skip EFI system partitions and boot loaders
+        // Skip EFI mount points (keep /boot so compact disk table matches duf)
         if (std.mem.eql(u8, mountpoint, "/boot/efi") or
-            std.mem.eql(u8, mountpoint, "/efi") or
-            std.mem.eql(u8, mountpoint, "/boot"))
+            std.mem.eql(u8, mountpoint, "/efi"))
         {
             continue;
         }
@@ -552,7 +555,9 @@ fn procReadWorker(work: *ProcReadWork) void {
             // Resolve the owner relative to the already-open /proc directory.
             // Existing processes reuse ProcessMeta, so this syscall normally
             // runs only for newly-created or PID-reused processes.
-            const pid_path = std.fmt.bufPrintZ(&relative_buf, "{d}", .{pid}) catch continue;
+            const pid_str = std.fmt.bufPrint(relative_buf[0 .. relative_buf.len - 1], "{d}", .{pid}) catch continue;
+            relative_buf[pid_str.len] = 0;
+            const pid_path: [:0]const u8 = relative_buf[0..pid_str.len :0];
             var stx: std.os.linux.Statx = undefined;
             break :blk if (std.os.linux.errno(std.os.linux.statx(
                 work.dir.handle,
@@ -1190,6 +1195,23 @@ pub const Linux = struct {
             .battery_pct = bat_pct,
             .battery_status = bat_status,
         };
+    }
+
+    /// Whether `pid` has the same controlling terminal as top-q, i.e. whether
+    /// it can write over our screen. Read errors answer false.
+    pub fn sharesTty(pid: Pid) bool {
+        const own = readTtyNr("/proc/self/stat") orelse return false;
+        if (own == 0) return false;
+        var path_buf: [32]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/proc/{d}/stat", .{pid}) catch return false;
+        return readTtyNr(path) == own;
+    }
+
+    fn readTtyNr(path: []const u8) ?i32 {
+        var buf: [1024]u8 = undefined;
+        const n = readSmallFile(path, &buf) catch return null;
+        const ps = parsePidStat(buf[0..n]) catch return null;
+        return ps.tty_nr;
     }
 
     pub fn signal(self: *Linux, pid: Pid, sig: Signal) !void {

@@ -13,6 +13,9 @@ pub const Impl = switch (builtin.os.tag) {
     else => @compileError("Unsupported OS for top-q"),
 };
 
+/// Whether `pid` shares top-q's controlling terminal (can write over the UI).
+pub const sharesTty = Impl.sharesTty;
+
 /// ProcessSource — the only OS-coupled surface the rest of the app sees.
 /// All methods delegate to the comptime-selected backend.
 pub const ProcessSource = struct {

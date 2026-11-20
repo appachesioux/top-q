@@ -31,6 +31,7 @@ pub const SYS_BLOCK_W: u16 = 50;
 pub const MEM_BLOCK_W: u16 = 35;
 pub const DISK_BLOCK_W: u16 = 40;
 pub const NET_BLOCK_W: u16 = 25;
+pub const NET_MAX_W: u16 = 32;
 
 /// Fixed sys-block content rows: OS, Kernel, Uptime, CPU, Load, Battery.
 /// GPUs add one row each on top of these.
@@ -208,14 +209,15 @@ fn drawTopPanels(
     drawMemBlock(alloc, win, x, 0, mem_w, heights.row1, s, sys_history);
     x += mem_w;
 
-    // 3. disk block (widened)
+    // 3. disk block (widened; when 4 blocks are visible, absorbs surplus above NET_MAX_W)
     if (n_blocks >= 3) {
-        const disk_w = if (n_blocks == 3) w - x else base_w + delta;
+        const net_w: u16 = if (n_blocks >= 4) @min(base_w -| delta, NET_MAX_W) else 0;
+        const disk_w = w - x - net_w;
         drawDiskBlock(alloc, win, x, 0, disk_w, heights.row1, s, sys_history);
         x += disk_w;
     }
 
-    // 4. net block (absorbs the remainder — shrunk)
+    // 4. net block (capped so disk's duf-style table gets the extra width)
     if (n_blocks >= 4) {
         const net_w = w - x;
         drawNetBlock(alloc, win, x, 0, net_w, heights.row1, s, sys_history);
@@ -344,6 +346,13 @@ fn pctOf(used: u64, total: u64) f32 {
     return @floatCast(100.0 * @as(f64, @floatFromInt(used)) / @as(f64, @floatFromInt(total)));
 }
 
+/// Denominator for disk percentages, same as df: used + avail. Blocks reserved
+/// for root are neither, so dividing by total would leave Used% + Avail% short
+/// of 100% (~5% on ext4) and Used% below what df reports.
+fn diskPctBase(d: process.DiskMount) u64 {
+    return d.used_bytes + d.avail_bytes;
+}
+
 /// Format "used/total" in human-friendly units; empty slice when total == 0.
 /// Memory is arena-allocated (frame arena); lifetime ends at the next frame.
 fn absUsedTotal(alloc: std.mem.Allocator, used: u64, total: u64) []const u8 {
@@ -398,23 +407,136 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
     }
 }
 
+const DISK_NUM_W: u16 = 7; // fits formatBytes outputs like "1022.0M", "887.6G"
+const DISK_PCT_W: u16 = 4; // " 88%"
+const DISK_TYPE_W: u16 = 5; // "ext4 ", "vfat ", "btrfs"
+
+const DiskTableLayout = struct {
+    mount_col: u16,
+    mount_w: u16,
+    size_col: ?u16 = null,
+    used_col: ?u16 = null,
+    avail_col: ?u16 = null,
+    bar_col: ?u16 = null,
+    bar_w: u16 = 0,
+    pct_col: u16,
+    type_col: ?u16 = null,
+};
+
+fn computeDiskTableLayout(inner_w: u16, disks: []const process.DiskMount) DiskTableLayout {
+    // Desired mount column width: wide enough for "MOUNT" (5) and actual paths, capped at 16.
+    var max_mount: u16 = 5;
+    for (disks) |d| {
+        const len: u16 = @intCast(@min(d.mount_path.len, 16));
+        if (len > max_mount) max_mount = len;
+    }
+
+    // Usable width excludes 1-col left/right padding inside the box.
+    const usable: u16 = inner_w -| 2;
+    const mount_col: u16 = 1;
+
+    // Helper: try fitting a combination of optional columns with a minimum bar width.
+    // Returns null if it does not fit in `usable`.
+    const Tier = struct {
+        size: bool,
+        used: bool,
+        avail: bool,
+        min_bar: u16,
+        fs_type: bool,
+    };
+    const tiers = [_]Tier{
+        .{ .size = true, .used = true, .avail = true, .min_bar = 8, .fs_type = true },
+        .{ .size = true, .used = true, .avail = true, .min_bar = 6, .fs_type = false },
+        .{ .size = false, .used = true, .avail = true, .min_bar = 6, .fs_type = false },
+        .{ .size = false, .used = false, .avail = true, .min_bar = 4, .fs_type = false },
+        .{ .size = false, .used = false, .avail = true, .min_bar = 0, .fs_type = false },
+    };
+
+    for (tiers) |t| {
+        var fixed: u16 = DISK_PCT_W; // always present
+        if (t.size) fixed += 1 + DISK_NUM_W;
+        if (t.used) fixed += 1 + DISK_NUM_W;
+        if (t.avail) fixed += 1 + DISK_NUM_W;
+        if (t.min_bar > 0) fixed += 2 + t.min_bar + 1; // 2-col gap before bar, 1-col gap before pct
+        if (t.min_bar == 0) fixed += 1; // 1-col gap before pct
+        if (t.fs_type) fixed += 1 + DISK_TYPE_W;
+
+        const mount_w: u16 = if (usable >= fixed + max_mount)
+            max_mount
+        else if (usable >= fixed + 5)
+            usable - fixed
+        else
+            continue;
+
+        const extra: u16 = usable - (fixed + mount_w);
+        var cur: u16 = mount_col + mount_w;
+        var out: DiskTableLayout = .{
+            .mount_col = mount_col,
+            .mount_w = mount_w,
+            .pct_col = 0,
+        };
+        if (t.size) {
+            cur += 1;
+            out.size_col = cur;
+            cur += DISK_NUM_W;
+        }
+        if (t.used) {
+            cur += 1;
+            out.used_col = cur;
+            cur += DISK_NUM_W;
+        }
+        if (t.avail) {
+            cur += 1;
+            out.avail_col = cur;
+            cur += DISK_NUM_W;
+        }
+        if (t.min_bar > 0) {
+            cur += 2;
+            out.bar_col = cur;
+            out.bar_w = t.min_bar + extra;
+            cur += out.bar_w + 1;
+        } else {
+            cur += 1;
+        }
+        out.pct_col = cur;
+        cur += DISK_PCT_W;
+        if (t.fs_type) {
+            cur += 1;
+            out.type_col = cur;
+        }
+        return out;
+    }
+
+    // Extreme fallback for tiny boxes: MOUNT + USE%.
+    const pct_col: u16 = if (inner_w > DISK_PCT_W + 1) inner_w - 1 - DISK_PCT_W else 1;
+    const mount_w: u16 = if (pct_col > mount_col + 1) pct_col - mount_col - 1 else 1;
+    return .{
+        .mount_col = mount_col,
+        .mount_w = mount_w,
+        .pct_col = pct_col,
+    };
+}
+
+/// Bracketless duf-style progress bar: filled `█` in usage gradient + `░` track.
+fn drawDiskBar(win: Window, col: u16, row: u16, bar_w: u16, pct: f32) void {
+    if (bar_w == 0) return;
+    const clamped: f32 = std.math.clamp(pct, 0.0, 100.0);
+    var filled: u16 = @intFromFloat(@as(f32, @floatFromInt(bar_w)) * (clamped / 100.0));
+    if (filled == 0 and clamped > 0) filled = 1;
+    if (filled > bar_w) filled = bar_w;
+    const bar_style = style.gradientStyle(pct);
+    var i: u16 = 0;
+    while (i < bar_w) : (i += 1) {
+        win.writeCell(col + i, row, .{
+            .char = .{ .grapheme = if (i < filled) BAR_FILLED else BAR_EMPTY, .width = 1 },
+            .style = if (i < filled) bar_style else style.dim_style,
+        });
+    }
+}
+
 fn drawDiskBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h: u16, s: *const process.SystemSummary, sys_history: *const sample_mod.SystemHistory) void {
     const box = borderedBox(win, x, y, w, h);
     if (box.height < 1) return;
-
-    const disk_title = if (s.fs_type_name.len > 0)
-        std.fmt.allocPrint(alloc, " disk · {s} ", .{s.fs_type_name}) catch " disk "
-    else
-        " disk ";
-    drawBorderTitle(win, x, y, disk_title);
-
-    const has_sparkline = (box.height >= 3 and box.width >= 4);
-    const has_throughput = (box.height >= 3);
-    const sparkline_row: ?u16 = if (has_sparkline) box.height - 1 else null;
-    const throughput_row: ?u16 = if (has_throughput) (if (has_sparkline and box.height >= 3) box.height - 2 else box.height - 1) else null;
-    const bar_budget: u16 = if (throughput_row) |tr| tr else box.height;
-
-    var rows_list = std.ArrayList(LabelledRow).initCapacity(alloc, 16) catch return;
 
     const disks = if (s.disks.len > 0) s.disks else if (s.fs_root_total_bytes > 0) &[_]process.DiskMount{.{
         .mount_path = s.fs_mount_path,
@@ -424,74 +546,147 @@ fn drawDiskBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, 
         .avail_bytes = s.fs_root_avail_bytes,
     }} else &.{};
 
-    if (disks.len > 0 and bar_budget > 0) {
-        var start_idx: usize = 0;
-        for (disks, 0..) |d, i| {
-            if (std.mem.eql(u8, d.mount_path, s.fs_mount_path)) {
-                start_idx = i;
+    const layout = computeDiskTableLayout(box.width, disks);
+
+    // Show fs type in the border title only when the TYPE column isn't shown
+    // and every visible disk shares the same type.
+    var single_fs_type = s.fs_type_name.len > 0 and layout.type_col == null;
+    if (single_fs_type and disks.len > 1) {
+        for (disks[1..]) |d| {
+            if (!std.mem.eql(u8, d.fs_type_name, disks[0].fs_type_name)) {
+                single_fs_type = false;
                 break;
             }
         }
+    }
+    const disk_title = if (single_fs_type)
+        std.fmt.allocPrint(alloc, " disk · {s} ", .{s.fs_type_name}) catch " disk "
+    else
+        " disk ";
+    drawBorderTitle(win, x, y, disk_title);
 
-        if (bar_budget >= disks.len * 2) {
-            // Mode 1: All disks fit with 2 rows (Used + Avail)
-            for (disks) |d| {
-                const root_pct = pctOf(d.used_bytes, d.total_bytes);
-                const avail_pct = pctOf(d.avail_bytes, d.total_bytes);
-                const label = if (d.mount_path.len <= 6) d.mount_path else d.mount_path[d.mount_path.len - 6 ..];
-                rows_list.append(alloc, .{
-                    .label = label,
-                    .pct = root_pct,
-                    .abs = absUsedTotal(alloc, d.used_bytes, d.total_bytes),
-                }) catch break;
-                rows_list.append(alloc, .{
-                    .label = "Avail:",
-                    .pct = avail_pct,
-                    .abs = absUsedTotal(alloc, d.avail_bytes, d.total_bytes),
-                    .invert_color = true,
-                }) catch break;
+    const has_sparkline = (box.height >= 3 and box.width >= 4);
+    const has_throughput = (box.height >= 3);
+    const sparkline_row: ?u16 = if (has_sparkline) box.height - 1 else null;
+    const throughput_row: ?u16 = if (has_throughput) (if (has_sparkline) box.height - 2 else box.height - 1) else null;
+    const table_budget: u16 = if (throughput_row) |tr| tr else box.height;
+
+    if (disks.len > 0 and table_budget > 0 and box.width >= 10) {
+        var row: u16 = 0;
+        const show_header = table_budget >= 2;
+        if (show_header) {
+            const hdr_mount = if (layout.mount_w >= 5) "MOUNT" else "MNT"[0..@min(@as(usize, 3), layout.mount_w)];
+            _ = box.printSegment(.{ .text = hdr_mount, .style = style.dim_style }, .{
+                .row_offset = 0,
+                .col_offset = layout.mount_col,
+            });
+            if (layout.size_col) |c| {
+                _ = box.printSegment(.{ .text = "   SIZE", .style = style.dim_style }, .{
+                    .row_offset = 0,
+                    .col_offset = c,
+                });
             }
-        } else if (bar_budget >= disks.len) {
-            // Mode 2: All disks fit with 1 row each (Used), plus Avail row for the first N disks that fit
-            const extra_avail_rows = bar_budget - disks.len;
+            if (layout.used_col) |c| {
+                _ = box.printSegment(.{ .text = "   USED", .style = style.dim_style }, .{
+                    .row_offset = 0,
+                    .col_offset = c,
+                });
+            }
+            if (layout.avail_col) |c| {
+                _ = box.printSegment(.{ .text = "  AVAIL", .style = style.dim_style }, .{
+                    .row_offset = 0,
+                    .col_offset = c,
+                });
+            }
+            const use_hdr_col = if (layout.bar_col) |bc| bc else layout.pct_col;
+            _ = box.printSegment(.{ .text = "USE%", .style = style.dim_style }, .{
+                .row_offset = 0,
+                .col_offset = use_hdr_col,
+            });
+            if (layout.type_col) |c| {
+                _ = box.printSegment(.{ .text = "TYPE", .style = style.dim_style }, .{
+                    .row_offset = 0,
+                    .col_offset = c,
+                });
+            }
+            row = 1;
+        }
+
+        const max_disk_rows: usize = table_budget - row;
+        var start_idx: usize = 0;
+        if (disks.len > max_disk_rows) {
             for (disks, 0..) |d, i| {
-                const root_pct = pctOf(d.used_bytes, d.total_bytes);
-                const label = if (d.mount_path.len <= 6) d.mount_path else d.mount_path[d.mount_path.len - 6 ..];
-                rows_list.append(alloc, .{
-                    .label = label,
-                    .pct = root_pct,
-                    .abs = absUsedTotal(alloc, d.used_bytes, d.total_bytes),
-                }) catch break;
-                if (i < extra_avail_rows) {
-                    const avail_pct = pctOf(d.avail_bytes, d.total_bytes);
-                    rows_list.append(alloc, .{
-                        .label = "Avail:",
-                        .pct = avail_pct,
-                        .abs = absUsedTotal(alloc, d.avail_bytes, d.total_bytes),
-                        .invert_color = true,
-                    }) catch break;
+                if (std.mem.eql(u8, d.mount_path, s.fs_mount_path)) {
+                    start_idx = i;
+                    break;
                 }
-            }
-        } else {
-            // Mode 3: Not all disks fit, show as many disks as fit starting from start_idx
-            var count: usize = 0;
-            while (count < disks.len and rows_list.items.len < bar_budget) : (count += 1) {
-                const d_idx = (start_idx + count) % disks.len;
-                const d = disks[d_idx];
-                const root_pct = pctOf(d.used_bytes, d.total_bytes);
-                const label = if (d.mount_path.len <= 6) d.mount_path else d.mount_path[d.mount_path.len - 6 ..];
-                rows_list.append(alloc, .{
-                    .label = label,
-                    .pct = root_pct,
-                    .abs = absUsedTotal(alloc, d.used_bytes, d.total_bytes),
-                }) catch break;
             }
         }
 
-        drawLabelledBars(alloc, box, rows_list.items);
+        const visible_n: usize = @min(disks.len, max_disk_rows);
+        var count: usize = 0;
+        while (count < visible_n) : (count += 1) {
+            const d = disks[(start_idx + count) % disks.len];
+            const base = diskPctBase(d);
+            const used_pct = pctOf(d.used_bytes, base);
+            const avail_pct = pctOf(d.avail_bytes, base);
+
+            const mlabel = if (d.mount_path.len <= layout.mount_w)
+                d.mount_path
+            else
+                d.mount_path[d.mount_path.len - layout.mount_w ..];
+            _ = box.printSegment(.{ .text = mlabel, .style = style.cyan_style }, .{
+                .row_offset = row,
+                .col_offset = layout.mount_col,
+            });
+
+            if (layout.size_col) |c| {
+                var sb: [16]u8 = undefined;
+                const s_txt = std.fmt.allocPrint(alloc, "{s:>7}", .{utils.formatBytes(d.total_bytes, &sb)}) catch "";
+                _ = box.printSegment(.{ .text = s_txt, .style = style.default_style }, .{
+                    .row_offset = row,
+                    .col_offset = c,
+                });
+            }
+            if (layout.used_col) |c| {
+                var ub: [16]u8 = undefined;
+                const u_txt = std.fmt.allocPrint(alloc, "{s:>7}", .{utils.formatBytes(d.used_bytes, &ub)}) catch "";
+                _ = box.printSegment(.{ .text = u_txt, .style = style.default_style }, .{
+                    .row_offset = row,
+                    .col_offset = c,
+                });
+            }
+            if (layout.avail_col) |c| {
+                var ab: [16]u8 = undefined;
+                const a_txt = std.fmt.allocPrint(alloc, "{s:>7}", .{utils.formatBytes(d.avail_bytes, &ab)}) catch "";
+                _ = box.printSegment(.{ .text = a_txt, .style = style.gradientInverseStyle(avail_pct) }, .{
+                    .row_offset = row,
+                    .col_offset = c,
+                });
+            }
+            if (layout.bar_col) |c| {
+                drawDiskBar(box, c, row, layout.bar_w, used_pct);
+            }
+
+            const pct_txt = std.fmt.allocPrint(alloc, "{d:>3.0}%", .{used_pct}) catch "";
+            _ = box.printSegment(.{ .text = pct_txt, .style = style.default_style }, .{
+                .row_offset = row,
+                .col_offset = layout.pct_col,
+            });
+
+            if (layout.type_col) |c| {
+                const tname = if (d.fs_type_name.len <= DISK_TYPE_W) d.fs_type_name else d.fs_type_name[0..DISK_TYPE_W];
+                _ = box.printSegment(.{ .text = tname, .style = style.dim_style }, .{
+                    .row_offset = row,
+                    .col_offset = c,
+                });
+            }
+
+            row += 1;
+        }
     }
 
-    // Throughput lines below the bars.
+    // Throughput lines below the table.
     var rb: [16]u8 = undefined;
     var wb: [16]u8 = undefined;
     const rd = utils.formatBytes(s.disk_read_bps, &rb);
@@ -1360,6 +1555,7 @@ const help_right = [_][]const u8{
     "",
     "GENERAL",
     "  t            Theme light/dark",
+    "  C-l          Redraw screen",
     "  F1           This help",
 };
 
@@ -1519,4 +1715,52 @@ test "help viewport never exceeds content, at any height" {
         // Scrolling to the very end must land exactly on the last row.
         try std.testing.expectEqual(helpContentRows(), helpViewportRows(h) + helpMaxScroll(h));
     }
+}
+
+test "disk percentages use df base and ignore the root reserve" {
+    // 100 blocks: 50 used, 45 avail, 5 reserved for root.
+    const d: process.DiskMount = .{ .mount_path = "/", .fs_type_name = "ext4", .used_bytes = 50, .total_bytes = 100, .avail_bytes = 45 };
+    const used_pct = pctOf(d.used_bytes, diskPctBase(d));
+    const avail_pct = pctOf(d.avail_bytes, diskPctBase(d));
+    try std.testing.expectApproxEqAbs(@as(f32, 52.63), used_pct, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 100), used_pct + avail_pct, 0.01);
+}
+
+test "disk table layout never overflows and degrades cleanly across widths" {
+    const sample_disks = [_]process.DiskMount{
+        .{ .mount_path = "/", .fs_type_name = "ext4" },
+        .{ .mount_path = "/boot", .fs_type_name = "vfat" },
+        .{ .mount_path = "/home", .fs_type_name = "ext4" },
+    };
+
+    var w: u16 = 16;
+    while (w <= 120) : (w += 1) {
+        const l = computeDiskTableLayout(w, &sample_disks);
+        try std.testing.expect(l.mount_col + l.mount_w < l.pct_col);
+        if (l.size_col) |c| try std.testing.expect(c + DISK_NUM_W <= w);
+        if (l.used_col) |c| try std.testing.expect(c + DISK_NUM_W <= w);
+        if (l.avail_col) |c| try std.testing.expect(c + DISK_NUM_W <= w);
+        if (l.bar_col) |c| {
+            try std.testing.expect(l.bar_w > 0);
+            try std.testing.expect(c + l.bar_w < l.pct_col);
+        }
+        try std.testing.expect(l.pct_col + DISK_PCT_W <= w);
+        if (l.type_col) |c| try std.testing.expect(c + DISK_TYPE_W <= w);
+    }
+
+    // Wide box (~70 cols, typical 4-block desktop layout): full duf columns.
+    const wide = computeDiskTableLayout(70, &sample_disks);
+    try std.testing.expect(wide.size_col != null);
+    try std.testing.expect(wide.used_col != null);
+    try std.testing.expect(wide.avail_col != null);
+    try std.testing.expect(wide.bar_col != null and wide.bar_w >= 8);
+    try std.testing.expect(wide.type_col != null);
+
+    // Narrowest 3-block disk box (inner_w = 37): sheds TYPE and SIZE, keeps USED + AVAIL + BAR + USE%.
+    const narrow = computeDiskTableLayout(37, &sample_disks);
+    try std.testing.expect(narrow.type_col == null);
+    try std.testing.expect(narrow.size_col == null);
+    try std.testing.expect(narrow.used_col != null);
+    try std.testing.expect(narrow.avail_col != null);
+    try std.testing.expect(narrow.bar_col != null and narrow.bar_w >= 6);
 }

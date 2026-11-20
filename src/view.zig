@@ -5,6 +5,32 @@ const sample_mod = @import("sample.zig");
 
 pub const DetailPanel = enum { graphs, threads, fds };
 
+/// Full-repaint window after signalling a process that shares our tty. A dying
+/// process (and the shell's job notice right after it) can write over the UI;
+/// diff rendering never wipes that, so every tick repaints all cells while the
+/// PID lives, plus GRACE_TICKS after it exits, capped at MAX_TICKS so a signal
+/// that does not kill (HUP, USR1) cannot keep full repaints on forever.
+pub const RepaintWatch = struct {
+    pid: process.Pid,
+    ticks_left: u8 = MAX_TICKS,
+    grace_left: u8 = GRACE_TICKS,
+
+    pub const MAX_TICKS: u8 = 30;
+    pub const GRACE_TICKS: u8 = 2;
+
+    /// Called once per refresh tick. True → repaint this frame; false → the
+    /// window is over and the watch can be dropped.
+    pub fn tick(self: *RepaintWatch, alive: bool) bool {
+        if (self.ticks_left == 0) return false;
+        self.ticks_left -= 1;
+        if (!alive) {
+            if (self.grace_left == 0) return false;
+            self.grace_left -= 1;
+        }
+        return true;
+    }
+};
+
 pub const SortKey = enum { cpu, mem, pid, name, user };
 pub const SortDir = enum { desc, asc };
 
@@ -555,4 +581,20 @@ test "matchStats treats an empty needle as no search at all" {
     const st = matchStats(&procs, &sorted, "", 1);
     try std.testing.expectEqual(@as(usize, 0), st.total);
     try std.testing.expectEqual(@as(usize, 0), st.pos);
+}
+
+test "RepaintWatch repaints while alive, then GRACE_TICKS after exit" {
+    var w: RepaintWatch = .{ .pid = 42 };
+    try std.testing.expect(w.tick(true));
+    try std.testing.expect(w.tick(true));
+    var i: u8 = 0;
+    while (i < RepaintWatch.GRACE_TICKS) : (i += 1) try std.testing.expect(w.tick(false));
+    try std.testing.expect(!w.tick(false));
+}
+
+test "RepaintWatch stops at MAX_TICKS when the process survives" {
+    var w: RepaintWatch = .{ .pid = 42 };
+    var i: u8 = 0;
+    while (i < RepaintWatch.MAX_TICKS) : (i += 1) try std.testing.expect(w.tick(true));
+    try std.testing.expect(!w.tick(true));
 }
