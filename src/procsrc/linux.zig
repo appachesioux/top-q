@@ -273,11 +273,15 @@ pub const MountEntry = struct {
     pub fn device(self: *const MountEntry) []const u8 {
         return self.dev_buf[0..self.dev_len];
     }
+
+    fn pathLessThan(_: void, a: MountEntry, b: MountEntry) bool {
+        return std.mem.lessThan(u8, a.path(), b.path());
+    }
 };
 
 /// Parse `/proc/mounts` into `out`, skipping pseudo filesystems, duplicate device
-/// subvolumes (e.g. Btrfs @tmp/@log), and EFI boot partitions. Returns the
-/// number of entries written. Caller-provided buffer caps the count.
+/// subvolumes (e.g. Btrfs @tmp/@log), and EFI boot partitions. Sorts by mount
+/// path and returns the number of entries written, capped by the buffer size.
 pub fn enumerateMounts(buf: []const u8, out: []MountEntry) u8 {
     var n: u8 = 0;
     var lines = std.mem.splitScalar(u8, buf, '\n');
@@ -346,25 +350,7 @@ pub fn enumerateMounts(buf: []const u8, out: []MountEntry) u8 {
         n += 1;
     }
 
-    // Ensure "/" is at index 0 if present
-    var root_idx: ?usize = null;
-    for (out[0..n], 0..) |m, i| {
-        if (std.mem.eql(u8, m.path(), "/")) {
-            root_idx = i;
-            break;
-        }
-    }
-    if (root_idx) |ri| {
-        if (ri > 0) {
-            const root_entry = out[ri];
-            var k: usize = ri;
-            while (k > 0) : (k -= 1) {
-                out[k] = out[k - 1];
-            }
-            out[0] = root_entry;
-        }
-    }
-
+    std.sort.pdq(MountEntry, out[0..n], {}, MountEntry.pathLessThan);
     return n;
 }
 

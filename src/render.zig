@@ -408,7 +408,7 @@ fn drawMemBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, h
 }
 
 const DISK_NUM_W: u16 = 7; // fits formatBytes outputs like "1022.0M", "887.6G"
-const DISK_PCT_W: u16 = 4; // " 88%"
+const DISK_PCT_W: u16 = 6; // "100.0%"
 const DISK_TYPE_W: u16 = 5; // "ext4 ", "vfat ", "btrfs"
 
 const DiskTableLayout = struct {
@@ -447,7 +447,7 @@ fn computeDiskTableLayout(inner_w: u16, disks: []const process.DiskMount) DiskTa
     const tiers = [_]Tier{
         .{ .size = true, .used = true, .avail = true, .min_bar = 8, .fs_type = true },
         .{ .size = true, .used = true, .avail = true, .min_bar = 6, .fs_type = false },
-        .{ .size = false, .used = true, .avail = true, .min_bar = 6, .fs_type = false },
+        .{ .size = false, .used = true, .avail = true, .min_bar = 5, .fs_type = false },
         .{ .size = false, .used = false, .avail = true, .min_bar = 4, .fs_type = false },
         .{ .size = false, .used = false, .avail = true, .min_bar = 0, .fs_type = false },
     };
@@ -668,7 +668,7 @@ fn drawDiskBlock(alloc: std.mem.Allocator, win: Window, x: u16, y: u16, w: u16, 
                 drawDiskBar(box, c, row, layout.bar_w, used_pct);
             }
 
-            const pct_txt = std.fmt.allocPrint(alloc, "{d:>3.0}%", .{used_pct}) catch "";
+            const pct_txt = std.fmt.allocPrint(alloc, "{d:>5.1}%", .{used_pct}) catch "";
             _ = box.printSegment(.{ .text = pct_txt, .style = style.default_style }, .{
                 .row_offset = row,
                 .col_offset = layout.pct_col,
@@ -1762,5 +1762,5 @@ test "disk table layout never overflows and degrades cleanly across widths" {
     try std.testing.expect(narrow.size_col == null);
     try std.testing.expect(narrow.used_col != null);
     try std.testing.expect(narrow.avail_col != null);
-    try std.testing.expect(narrow.bar_col != null and narrow.bar_w >= 6);
+    try std.testing.expect(narrow.bar_col != null and narrow.bar_w >= 5);
 }

@@ -1,7 +1,7 @@
 .{
     .fingerprint = 0xe7e53e266d9da678,
     .name = .top_q,
-    .version = "26.11.20",
+    .version = "26.11.21",
     .dependencies = .{
         .vaxis = .{
             .url = "git+https://github.com/rockorager/libvaxis.git#25b4bd7371cc3c32049e103ab292a525a1ecb7a7",
